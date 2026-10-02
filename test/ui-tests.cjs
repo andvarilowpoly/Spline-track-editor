@@ -1,0 +1,1953 @@
+#!/usr/bin/env node
+// Pruebas de interfaz (Playwright + Chromium sin ventana). Una sola página para todas las pruebas; en vez de esperas
+// fijas se espera a que la app quede quieta (window.__tsg.idle()). Cada prueba verifica (no solo imprime) y el
+// resultado final dice cuántas pasaron.
+//
+//   npm run test:ui                 todas
+//   npm run test:ui -- tunel arbol  solo las que contienen alguna de esas palabras en el nombre
+//   npm run test:ui -- -j 4         en 4 procesos en paralelo (por defecto: según los núcleos, hasta 4)
+//
+// Cada prueba deja la app en un estado conocido al empezar (carga el óvalo o una página limpia), así se pueden
+// correr solas, en cualquier orden o repartidas entre procesos.
+//
+// Requiere: npm install (instala playwright) y, la primera vez, npx playwright install chromium.
+// No revisa todos los deslizadores (a propósito): prueba el comportamiento de cada función.
+const path = require('path');
+const os = require('os');
+const { spawn } = require('child_process');
+const { chromium } = require('playwright');
+
+const ROOT = path.join(__dirname, '..');
+let URL = '';
+const argv = process.argv.slice(2);
+let jobs = Math.max(1, Math.min(4, os.cpus().length - 1));
+const jIdx = argv.findIndex((a) => a === '-j' || a === '--jobs');
+if (jIdx >= 0) { jobs = Math.max(1, parseInt(argv[jIdx + 1], 10) || 1); argv.splice(jIdx, 2); }
+const SHARD = process.env.TSG_SHARD ? process.env.TSG_SHARD.split('/').map(Number) : null; // [i, n] (proceso hijo)
+const filters = argv.map((s) => s.toLowerCase());
+const tests = [];
+const test = (name, fn) => tests.push({ name, fn });
+
+// ---------------------------------------------------------------------------------------------------------------
+// helpers
+let page, errs = [], downloads = [];
+const ev = (fn, arg) => page.evaluate(fn, arg);
+const idle = () => page.evaluate(() => window.__tsg.idle());
+function expect(cond, msg) { if (!cond) throw new Error(msg); }
+const approx = (a, b, tol) => Math.abs(a - b) <= tol;
+async function sample(name) {
+  await page.selectOption('#sampleSelect', name);
+  await idle();
+}
+async function tool(t) { await ev((t) => document.querySelector(`[data-tool=${t}]`).click(), t); await idle(); }
+const LANG = process.env.TSG_LANG || 'es';
+let dialogs = []; // mensajes de confirm/alert vistos (se aceptan solos)
+async function freshPage() {
+  await page.goto(URL);
+  await ev((lang) => { localStorage.clear(); localStorage.setItem('tsg.autosave', JSON.stringify({ on: false })); localStorage.setItem('tsg.lang', lang); }, LANG); // sin autoguardado; idioma fijo (español salvo TSG_LANG)
+  await page.reload();
+  await page.waitForFunction(() => window.__tsg && window.__tsg.idle);
+  await idle();
+}
+/** Selecciona puntos de control de la ruta principal (índices). */
+const selPts = (idxs) => ev((idxs) => { const t = window.__tsg; t.app.setMultiSel({ key: 'main', idxs }, false); t.editor.draw(); t.profile.draw(); t.preview.updateHandles(); }, idxs);
+/** Coordenadas de pantalla de un punto del mundo en el mapa 2D. */
+const mapXY = (x, y) => ev(([x, y]) => { const t = window.__tsg, L = t.state.layout, [lx, ly] = L.toLayout(x, y), [sx, sy] = t.editor.toScreen(lx, ly), r = document.getElementById('canvas2d').getBoundingClientRect(); return [sx + r.left, sy + r.top]; }, [x, y]);
+/** Arrastra en pantalla (con pasos intermedios). */
+async function drag(x0, y0, x1, y1, steps = 3) { await page.mouse.move(x0, y0); await page.mouse.down(); await page.mouse.move(x1, y1, { steps }); await page.mouse.up(); }
+/** Nombres de los objetos de la escena exportada, agrupados por su padre. */
+const exportNames = () => ev(async () => {
+  const t = window.__tsg, m = await import('/js/export-glb.js');
+  const { root } = await m.buildExportScene(t.state.layout, t.state.result, t.state.scene, { deco: { assetById: (id) => t.app.assetById(id), sets: [...t.state.decoSets, ...(t.app.riverDecoSets ? t.app.riverDecoSets() : [])], paintFor: (s) => t.app.decoPaintWorld(s) }, triggers: t.app.triggersWorld(), tunnelTex: (uid, k) => t.app.tunnelTexCanvas(uid, k), assetById: (id) => t.app.assetById(id), cutWallFor: (i, k, p) => t.app.cutWallOwnTex(i, k, p), cutArtTop: t.state.cutArtTopTex, cutArtOut: t.state.cutArtOutTex, riverArt: t.state.riverArtTex, riverArtTop: t.state.riverArtTopTex, riverArtOut: t.state.riverArtOutTex, riverWallFor: (id, k, p) => t.app.riverWallOwnTex(id, k, p), signTex: (ty) => t.app.signTexCanvas(ty), waterTex: (c, i, l) => t.app.waterTexCanvas(c, i, l), waterOwn: (i, l) => t.app.waterOwnTex(i, l) }, t.app.terrainPaintWorld ? t.app.terrainPaintWorld() : null, t.app.hillsWorld(), null);
+  const out = {};
+  root.traverse((o) => { if (o !== root && o.name && o.parent) (out[o.parent.name || '?'] = out[o.parent.name || '?'] || []).push(o.name); });
+  return out;
+});
+/** Página limpia con el óvalo cargado (para pruebas que no dependen de las anteriores). */
+async function reset(name = 'oval') { await freshPage(); await sample(name); }
+/** Crea un tramo del tipo pedido con los puntos de control dados (herramienta Editar puntos). */
+async function makeTramo(type, idxs) {
+  await tool('edit');
+  await ev((type) => { document.getElementById('tramoType').value = type; }, type);
+  await selPts(idxs);
+  await ev(() => document.getElementById('btnBridge').click());
+  await idle();
+  const n = await ev(() => (window.__tsg.state.project.main.bridges || []).length);
+  expect(n >= 1, `no se creó el tramo (${await ev(() => document.getElementById('toast') && document.getElementById('toast').textContent)})`);
+}
+const addHill = (frac = 0.3, extra = {}) => ev(([frac, extra]) => {
+  const t = window.__tsg, L = t.state.layout, r = L.routes[0], i = Math.floor(r.n * frac), [x, y] = L.toLayout(r.x[i], r.y[i]);
+  t.state.hills = [{ id: 1, name: 'cerro_01', height: 40, hard: true, flat: 1, density: 40, maxTris: 15000, strokes: [{ x, y, r: 45 / L.scale, e: false }], ...extra }];
+  t.preview.update(false);
+}, [frac, extra]);
+
+// ---------------------------------------------------------------------------------------------------------------
+// pruebas
+test('carga: versión en el título y en la barra', async () => {
+  const [ver, title, bar] = await ev(async () => { const m = await import('/js/version.js'); return [m.VERSION, document.title, document.getElementById('appVersion').textContent]; });
+  expect(title.includes(`v${ver}`) && bar === `v${ver}`, `versión ${ver}: título «${title}», barra «${bar}»`);
+});
+
+test('ejemplos: óvalo, ocho y trébol se construyen', async () => {
+  for (const [n, minCross] of [['figure8', 1], ['trefoil', 3], ['oval', 0]]) {
+    await sample(n);
+    const [ok, cross] = await ev(() => [!!window.__tsg.state.layout && !!window.__tsg.state.result, window.__tsg.state.result ? window.__tsg.state.result.crossings.length : -1]);
+    expect(ok && cross >= minCross, `${n}: layout ${ok}, cruces ${cross}`);
+  }
+});
+
+test('barra superior: una sola herramienta activa y Esc vuelve a Navegar', async () => {
+  await sample('oval');
+  for (const t of ['edit', 'draw', 'paint', 'sculpt', 'hill', 'river', 'tsmooth']) {
+    await tool(t);
+    const act = await ev(() => [...document.querySelectorAll('#toolbar [data-tool].active, .side-tool[data-tool].active')].map((b) => b.dataset.tool));
+    expect(act.length === 1 && act[0] === t, `herramienta ${t}: activas ${act}`);
+  }
+  await ev(() => document.getElementById('btnHelix').click()); // selección de puntos para las operaciones de forma
+  await page.keyboard.press('Escape');
+  await idle();
+  const st = await ev(() => [window.__tsg.state.tool, document.querySelectorAll('#toolbar .active[data-tool]:not([data-tool=pan]), #btnHelix.active').length]);
+  expect(st[0] === 'pan' && st[1] === 0, `Esc: herramienta ${st[0]}, otros activos ${st[1]}`);
+});
+
+test('ventanas: Exportar y Ajustes se abren como ventana, Esc solo las cierra', async () => {
+  await tool('edit');
+  await page.click('#btnExportMenu');
+  const vis = await ev(() => { const p = document.getElementById('exportPop'), r = p.getBoundingClientRect(), el = document.elementFromPoint(r.left + r.width / 2, r.top + 60); return [!p.hidden, p.contains(el)]; });
+  expect(vis[0] && vis[1], `la ventana Exportar no se ve encima de todo: ${vis}`);
+  expect(await ev(() => !!document.getElementById('knotSpacing').closest('#exportPop') && !document.querySelector('section.panel[data-panel=export]')), 'las opciones de exportación no están en la ventana');
+  await page.keyboard.press('Escape');
+  const s2 = await ev(() => [document.getElementById('exportPop').hidden, window.__tsg.state.tool]);
+  expect(s2[0] && s2[1] === 'edit', `Esc: ventana cerrada ${s2[0]}, herramienta ${s2[1]} (debía seguir en edit)`);
+  await page.click('#btnSettings');
+  expect(await ev(() => !document.getElementById('settingsPop').hidden), 'Ajustes no se abrió');
+  await page.click('#btnSettingsClose');
+  expect(await ev(() => document.getElementById('settingsPop').hidden), 'Ajustes no se cerró');
+});
+
+test('mensajes: error al centro (30 % más grande), informativo abajo', async () => {
+  await ev(() => window.__tsg.app.toast('Empieza y termina el trazo sobre la pista para redibujar ese tramo.'));
+  const e = await ev(() => { const t = document.getElementById('toast'), r = t.getBoundingClientRect(); return [Math.abs(r.top + r.height / 2 - innerHeight / 2), parseFloat(getComputedStyle(t).fontSize)]; });
+  expect(e[0] < 4 && approx(e[1], 15.6, 0.2), `error: a ${e[0].toFixed(1)} px del centro, letra ${e[1]} px`);
+  await page.waitForTimeout(3500);
+  expect(await ev(() => document.getElementById('toast').hidden), 'el mensaje de error dura más de 3,3 s');
+});
+
+test('avisos: «Eliminar avisos» (basurero) oculta los actuales y deja ver los nuevos', async () => {
+  await sample('oval');
+  await ev(() => { const t = window.__tsg; t.state.result.validation.msgs.push({ level: 'warn', msg: 'Aviso de prueba A' }, { level: 'error', msg: 'Error de prueba B' }); t.refreshPanels(); });
+  const b = await ev(() => { const bt = document.querySelector('#validation .vclear'); return [!!bt, !!(bt && bt.querySelector('svg')), document.querySelectorAll('#validation .vmsg').length]; });
+  expect(b[0] && b[1] && b[2] >= 2, `botón ${b[0]}, basurero ${b[1]}, avisos ${b[2]}`);
+  await page.click('#validation .vclear');
+  await ev(() => { const t = window.__tsg; t.state.result.validation.msgs.push({ level: 'warn', msg: 'Aviso nuevo C' }); t.refreshPanels(); });
+  const txt = await ev(() => [...document.querySelectorAll('#validation .vmsg')].map((e) => e.textContent).join('|'));
+  expect(txt.includes('Aviso nuevo C') && !txt.includes('prueba A') && !txt.includes('prueba B'), `tras eliminar: ${txt}`);
+});
+
+test('perfil: Aplanar, escalar alturas con el marco y deshacer', async () => {
+  await reset();
+  await tool('edit');
+  await selPts([20, 21, 22, 23, 24]);
+  expect(await ev(() => window.__tsg.app.flattenSelected()), 'Aplanar falló');
+  await idle();
+  let z = await ev(() => window.__tsg.app.selHeights().list.map((q) => q.z));
+  expect(Math.max(...z) - Math.min(...z) < 0.01, `Aplanar: alturas ${z.map((v) => v.toFixed(2))}`);
+  // alturas distintas y escala desde el más bajo con el asa de arriba
+  await ev(() => { const zs = window.__tsg.state.project.main.ctrlZ; [0, 1, 2, 1, 0].forEach((v, j) => (zs[20 + j] = v)); window.__tsg.scheduleBuild(); });
+  await idle();
+  await ev(() => window.__tsg.profile.draw());
+  const fr = await ev(() => { const f = window.__tsg.profile.zFrame, r = document.getElementById('canvasProfile').getBoundingClientRect(); return f && [r.left + f.cx, r.top + f.y0]; });
+  expect(fr, 'no apareció el marco de la selección en el perfil');
+  const z0 = await ev(() => window.__tsg.app.selHeights().list.map((q) => q.z));
+  await drag(fr[0], fr[1], fr[0], fr[1] - 25);
+  await idle();
+  z = await ev(() => window.__tsg.app.selHeights().list.map((q) => q.z));
+  expect(approx(Math.min(...z), Math.min(...z0), 0.05) && Math.max(...z) > Math.max(...z0) + 0.3, `escala Z: ${z0.map((v) => v.toFixed(2))} → ${z.map((v) => v.toFixed(2))}`);
+  await ev(() => document.activeElement && document.activeElement.blur());
+  await page.keyboard.press('Control+z');
+  await idle();
+  await selPts([20, 21, 22, 23, 24]);
+  z = await ev(() => window.__tsg.app.selHeights().list.map((q) => q.z));
+  expect(approx(Math.max(...z), Math.max(...z0), 0.05), `deshacer: ${z.map((v) => v.toFixed(2))}`);
+});
+
+test('perfil: Suavizar alturas (0–100) con extremos fijos', async () => {
+  await reset();
+  await tool('edit');
+  await selPts([30, 31, 32, 33, 34, 35]);
+  await ev(() => { const zs = window.__tsg.state.project.main.ctrlZ; [3, -2, 4, -1, 5, 0].forEach((v, j) => (zs[30 + j] = v)); window.__tsg.scheduleBuild(); });
+  await idle();
+  const setS = (v) => page.locator('#profSmooth').fill(String(v)); // la barra del perfil (la de verdad, con el mouse/teclado)
+  await setS(100);
+  const z = await ev(() => window.__tsg.app.selHeights().list.map((q) => q.z));
+  const lin = z.every((v, j) => approx(v, 3 - 0.6 * j, 0.35));
+  expect(approx(z[0], 3, 0.01) && approx(z[5], 0, 0.01) && lin, `suavizado 100: ${z.map((v) => v.toFixed(2))}`);
+  await setS(0);
+  const z0 = await ev(() => window.__tsg.app.selHeights().list.map((q) => q.z));
+  expect(approx(z0[1], -2, 0.01) && approx(z0[4], 5, 0.01), `volver a 0 recupera las alturas: ${z0.map((v) => v.toFixed(2))}`);
+  await selPts([40, 41, 42]);
+  expect((await ev(() => document.getElementById('profSmooth').value)) === '0', 'la barra no volvió a 0 al cambiar la selección');
+  expect((await ev(() => document.querySelectorAll('[id=smoothZ]').length)) === 1, 'hay ids repetidos (smoothZ)');
+});
+
+test('tramos: crear (Pista), tramo ancho desplazado hacia un lado', async () => {
+  await reset();
+  await makeTramo('track', [5, 6, 7, 8, 9]);
+  await ev(() => { const t = window.__tsg, b = t.state.project.main.bridges[0]; b.sameWidth = false; b.w = t.state.geom.width + 10; b.off = 1; b.collapsed = false; t.scheduleBuild(); });
+  await idle();
+  await ev(() => window.__tsg.refreshBridgeList());
+  const r = await ev(() => { const t = window.__tsg, rb = t.state.layout.routes[0].bridges[0], box = document.querySelector('#bridgeList .boBox'); return [rb.w, rb.off, box.classList.contains('disabled'), document.querySelector('#bridgeList .bo').textContent]; });
+  expect(r[1] === 1 && !r[2] && /5\.0 m a la derecha/.test(r[3]), `tramo ancho: ${JSON.stringify(r)}`);
+});
+
+test('tramos: el tipo Puente (texto nuevo): el terreno no se adapta y lleva pilares', async () => {
+  const txt = await ev(() => document.querySelector('#tramoType option[value=bridge]').textContent);
+  expect(txt === 'Puente: Terreno no se adapta y se crean pilares', `texto: ${txt}`);
+  await reset();
+  await ev(() => document.querySelector('#elevMode button[data-mode=direct]').click());
+  await idle();
+  await makeTramo('bridge', [6, 7, 8, 9, 10]);
+  await ev(() => { const t = window.__tsg, zs = t.state.project.main.ctrlZ; for (let i = 6; i <= 10; i++) zs[i] = 9; t.scheduleBuild(); });
+  await page.click('#btnGenTerrain');
+  await idle();
+  const r = await ev(async () => { const t = window.__tsg, m = await import('/js/scene.js'), L = t.state.layout, E = t.state.result, r = L.routes[0], b = r.bridges[0], i = Math.round(((b.s0 + b.s1) / 2) / r.ds) % r.n;
+    return [b.type, E.routes[0].z[i], t.preview.terrainData.sample(r.x[i], r.y[i]), m.bridgePillars(L, E, t.preview.terrainData, t.state.scene).length]; });
+  expect(r[0] === 'bridge' && r[2] < r[1] - 1.5 && r[3] > 0, `puente: tipo ${r[0]}, tablero ${r[1].toFixed(2)} m, terreno ${r[2].toFixed(2)} m, pilares ${r[3]}`);
+});
+
+test('ids únicos en la página', async () => {
+  const dup = await ev(() => { const c = {}; document.querySelectorAll('[id]').forEach((e) => { c[e.id] = (c[e.id] || 0) + 1; }); return Object.entries(c).filter(([, n]) => n > 1).map(([k]) => k); });
+  expect(!dup.length, `ids repetidos: ${dup}`);
+});
+
+test('pinceles: Aumentar/Disminuir subd. solo en Pintar subdivisión; Esculpir con 2 botones', async () => {
+  const vis = () => ev(() => ({ sub: !!document.getElementById('paintSubMode').offsetParent, sculpt: !!document.getElementById('sculptBox').offsetParent }));
+  for (const [t, sub, sculpt] of [['paint', true, false], ['sculpt', false, true], ['hill', false, false], ['river', false, false]]) {
+    await tool(t);
+    const v = await vis();
+    expect(v.sub === sub && v.sculpt === sculpt, `${t}: ${JSON.stringify(v)}`);
+  }
+  await tool('sculpt');
+  await page.click('#sculptMode button[data-smode=smooth]');
+  let s = await ev(() => [window.__tsg.state.scene.sculptMode, [...document.querySelectorAll('#sculptMode button.on')].map((b) => b.dataset.smode).join()]);
+  expect(s[0] === 'smooth' && s[1] === 'smooth', `suavizar: ${s}`);
+  await page.click('#sculptMode button[data-smode=raise]');
+  s = await ev(() => [window.__tsg.state.scene.sculptMode, [...document.querySelectorAll('#sculptMode button.on')].map((b) => b.dataset.smode).join()]);
+  expect(s[0] === 'raise' && s[1] === 'raise', `elevar: ${s}`);
+  // «Más detalle en lo esculpido» también en la barra del pincel (sincronizada con el panel)
+  expect(await ev(() => !!document.getElementById('sculptDetailBar').offsetParent), 'falta «Más detalle en lo esculpido» en la barra');
+  await page.click('#sculptDetailBar');
+  const det = await ev(() => [window.__tsg.state.scene.sculptDetail, document.getElementById('sculptDetail').checked, document.getElementById('sculptDetailBar').checked]);
+  expect(det[0] === false && det[1] === false && det[2] === false, `detalle esculpido: ${det}`);
+  await page.click('#sculptDetailBar');
+  await page.keyboard.press('Escape');
+});
+
+test('terreno: el pincel Esculpir (suavizar) conserva el volumen del relieve', async () => {
+  const r = await ev(async () => {
+    const m = await import('/js/scene.js');
+    const dabs = [{ x: 0, y: 0, r: 20, h: 5 }], F0 = m.sculptField(dabs), F1 = m.sculptField([...dabs, { x: 0, y: 0, r: 25, h: 1, smooth: true }]);
+    let v0 = 0, v1 = 0;
+    for (let x = -40; x <= 40; x += 1) for (let y = -40; y <= 40; y += 1) { v0 += F0.sample(x, y); v1 += F1.sample(x, y); }
+    return [F0.sample(0, 0), F1.sample(0, 0), v1 / v0];
+  });
+  expect(r[1] < r[0] && approx(r[2], 1, 0.05), `cima ${r[0].toFixed(2)} → ${r[1].toFixed(2)}, volumen ×${r[2].toFixed(3)}`);
+});
+
+test('cerros y túneles: túnel detectado; Quitar cerro deja solo el túnel con cáscara', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await addHill(0.3);
+  await idle();
+  await ev(() => window.__tsg.app.selectTunnel(0));
+  const a = await ev(() => [window.__tsg.preview.hillMeshes.length, (window.__tsg.state.tunnelInfo || []).length]);
+  expect(a[0] === 1 && a[1] >= 1, `cerros ${a[0]}, túneles ${a[1]}`);
+  await page.check('#tunnelList .tun-card.sel .tsNoHill');
+  await idle();
+  const b = await ev(() => [window.__tsg.preview.hillMeshes.length, (window.__tsg.state.tunnelInfo || []).length, window.__tsg.state.tunnelInfo[0].noHill]);
+  expect(b[0] === 0 && b[1] === a[1] && b[2], `sin cerro: cerros ${b[0]}, túneles ${b[1]}, noHill ${b[2]}`);
+  const names = Object.values(await exportNames()).flat();
+  expect(names.includes('tunel_01_cascara') && !names.some((n) => /^cerro_\d+$/.test(n)), `exportación: ${names.filter((n) => /tunel_01|cerro/.test(n))}`);
+  await ev(() => document.activeElement && document.activeElement.blur());
+  await page.keyboard.press('Control+z');
+  await idle();
+  expect((await ev(() => window.__tsg.preview.hillMeshes.length)) === 1, 'deshacer no devolvió el cerro');
+});
+
+test('cavernas: rocas sueltas sin single mesh, se mueven sobre el piso', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await addHill(0.3);
+  await idle();
+  await ev(() => { const t = window.__tsg; const ti = t.state.tunnelInfo[0]; t.state.scene.tunnelOverrides = [{ k: ti.k, s: +ti.sMid.toFixed(2), type: 'natural', caveSize: 0.8, singleMesh: false }]; t.preview.update(false); });
+  await idle();
+  await ev(() => window.__tsg.app.selectTunnel(0));
+  const n = await ev(() => window.__tsg.app.caveItemsSel().length);
+  expect(n > 0, `rocas y estalactitas sueltas: ${n}`);
+  const r = await ev(() => {
+    const t = window.__tsg, it = t.app.caveItemsSel().find((q) => q.kind === 'r');
+    if (!it) return null;
+    const x0 = it.x, y0 = it.y;
+    t.app.selectCave({ tid: 0, kind: 'r', key: it.key });
+    const P = t.app.moveCaveLive(t.state.selCave, x0 + 1.5, y0 + 1);
+    t.app.commitCaveMove(t.state.selCave, P);
+    return [P.x - x0, P.y - y0, JSON.stringify(t.state.scene.tunnelOverrides[0].caveMoves)];
+  });
+  expect(r && Math.hypot(r[0], r[1]) > 0.3 && r[2].includes('"r"'), `mover roca: ${JSON.stringify(r)}`);
+  await idle();
+  await page.keyboard.press('Escape');
+});
+
+test('árboles: el botón solo genera árboles; single mesh, editar, borrar, deshacer y exportar', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await page.click('#btnGenTrees');
+  await idle();
+  let s = await ev(() => [window.__tsg.state.scene.trees, window.__tsg.state.decoSets.length, document.getElementById('treeSingle').checked, document.getElementById('btnGenTrees').textContent]);
+  expect(s[0] && s[1] === 0 && s[2] && s[3] === 'Generar árboles y decoración', `generar: ${s}`);
+  let ex = await exportNames();
+  expect((ex.arboles || []).length === 1 && ex.arboles[0] === 'arboles_malla', `exporta una malla: ${(ex.arboles || []).slice(0, 3)}`);
+  await page.uncheck('#treeSingle');
+  await idle();
+  s = await ev(() => [window.__tsg.state.scene.treeBake.length, window.__tsg.app.vegEditItems().length]);
+  expect(s[0] > 10 && s[1] === s[0], `lista fija ${s[0]}, marcadores ${s[1]}`);
+  // arrastrar un árbol en el mapa: queda apoyado en el suelo
+  await tool('pan');
+  const it = await ev(() => { const q = window.__tsg.app.vegEditItems()[5]; return { i: q.i, x: q.x, y: q.y }; });
+  const [sx, sy] = await mapXY(it.x, it.y);
+  await drag(sx, sy, sx + 18, sy + 9);
+  await idle();
+  const m = await ev((i) => { const t = window.__tsg, tr = t.preview.treeData[i], G = t.preview.groundCache; return [tr.x, tr.y, tr.z - G.sample(tr.x, tr.y), JSON.stringify(t.state.selVeg)]; }, it.i);
+  expect(Math.hypot(m[0] - it.x, m[1] - it.y) > 2 && Math.abs(m[2]) < 1e-3 && m[3].includes('"tree"'), `arrastre 2D: ${JSON.stringify(m)}`);
+  // 3D: gizmo (mover en vivo + guardar)
+  const g = await ev(() => { const t = window.__tsg, v = t.state.selVeg, tr = t.preview.treeData[v.i], x0 = tr.x; const P = t.app.moveVegLive(v, tr.x + 4, tr.y + 3); t.app.commitVegMove(v, P); return t.preview.treeData[v.i].x - x0; });
+  expect(approx(g, 4, 0.01), `gizmo 3D: dx ${g}`);
+  const nb = await ev(() => window.__tsg.state.scene.treeBake.length);
+  await ev(() => document.activeElement && document.activeElement.blur());
+  await page.mouse.move(700, 450);
+  await page.keyboard.press('Delete');
+  await idle();
+  expect((await ev(() => window.__tsg.state.scene.treeBake.length)) === nb - 1, 'Supr no borró el árbol');
+  await page.keyboard.press('Control+z');
+  await idle();
+  expect((await ev(() => window.__tsg.state.scene.treeBake.length)) === nb, 'deshacer no devolvió el árbol');
+  ex = await exportNames();
+  expect((ex.arboles || []).length === nb && ex.arboles[0] === 'arbol_0001', `exporta un objeto por árbol: ${(ex.arboles || []).length} / ${nb}`);
+  await page.check('#treeSingle');
+  await idle();
+  s = await ev(() => [window.__tsg.state.scene.treeBake.length, window.__tsg.app.vegEditItems().length, !document.getElementById('btnTreeReset').hidden]);
+  expect(s[0] === nb && s[1] === 0 && s[2], `volver a single mesh conserva lo editado: ${s}`);
+  await page.click('#btnTreeReset');
+  await idle();
+  expect((await ev(() => window.__tsg.state.scene.treeBake)) === null, 'Restablecer no volvió a la distribución automática');
+});
+
+test('decoración: set con single mesh, editar un elemento en 3D y exportar', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await ev(() => document.getElementById('btnDecoNew').click());
+  await idle();
+  const c0 = '#decoList .deco-card:nth-child(1)';
+  let ex = await exportNames();
+  expect((ex.set_1 || []).length === 1 && ex.set_1[0] === 'set_1_malla', `set con single mesh: ${ex.set_1}`);
+  await page.uncheck(`${c0} .dsingle`);
+  await idle();
+  const n = await ev(() => { const s = window.__tsg.state.decoSets[0]; return [s.bake.length, (window.__tsg.preview.decoItemsBySet[s.id] || []).length]; });
+  expect(n[0] > 5 && n[0] === n[1], `lista fija del set: ${n}`);
+  // clic en 3D sobre un cubo (a través de los árboles)
+  await ev(() => { const t = window.__tsg, pv = t.preview, s = t.state.decoSets[0], it = pv.decoItemsBySet[s.id][8]; pv.controls.target.set(it.x, it.y, it.z); pv.camera.position.set(it.x + 10, it.y - 20, it.z + 14); pv.controls.update(); pv.needsFrame = true; t.app.selectVeg(null); });
+  await tool('pan');
+  const sc = await ev(() => { const t = window.__tsg, pv = t.preview, s = t.state.decoSets[0], it = pv.decoItemsBySet[s.id][8]; const v = pv.camera.position.clone().set(it.x, it.y, pv.vegZ(it.x, it.y, it.z) + 0.5).project(pv.camera); const r = pv.renderer.domElement.getBoundingClientRect(); return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; });
+  await page.mouse.click(sc[0], sc[1]);
+  const sel = await ev(() => window.__tsg.state.selVeg);
+  expect(sel && sel.kind === 'deco' && sel.i === 8, `clic 3D: ${JSON.stringify(sel)}`);
+  await page.click(`${c0} .ddel`);
+  await idle();
+  expect((await ev(() => window.__tsg.state.decoSets[0].bake.length)) === n[0] - 1, 'no se borró el elemento');
+  ex = await exportNames();
+  expect((ex.set_1 || []).length === n[0] - 1 && ex.set_1[0] === 'set_1_0001', `set sin single mesh: ${(ex.set_1 || []).length}`);
+});
+
+test('bordes: camino de tierra con ancho a cada lado; en un tramo, como la pista o propio', async () => {
+  await reset();
+  await ev(() => { const el = document.getElementById('dirtSide'); el.value = 'both'; el.dispatchEvent(new Event('change')); });
+  await page.locator('#dirtWidthLNum').fill('2'); await page.locator('#dirtWidthLNum').dispatchEvent('change');
+  await page.locator('#dirtWidthRNum').fill('5'); await page.locator('#dirtWidthRNum').dispatchEvent('change');
+  await idle();
+  const w = await ev(async () => { const t = window.__tsg, m = await import('/js/tunnels.js'), r = t.state.layout.routes[0]; return [m.dirtWidthAt(t.state.scene, r, 0, 10, 1), m.dirtWidthAt(t.state.scene, r, 0, 10, -1)]; });
+  expect(w[0] === 2 && w[1] === 5, `anchos izq./der.: ${w}`);
+  await makeTramo('track', [5, 6, 7, 8, 9]);
+  await ev(() => { const t = window.__tsg; t.state.project.main.bridges[0].collapsed = false; t.refreshBridgeList(); });
+  const sel = await ev(() => { const s2 = document.querySelector('#bridgeList .bdw'); return s2 && s2.value; });
+  expect(sel === 'inherit', `el tramo empieza «Como la pista»: ${sel}`);
+  await ev(() => { const s2 = document.querySelector('#bridgeList .bdw'); s2.value = 'own'; s2.dispatchEvent(new Event('change')); });
+  await ev(() => { const i = document.querySelector('#bridgeList .bdwL'); i.value = '7'; i.dispatchEvent(new Event('change')); });
+  await idle();
+  const tw = await ev(async () => { const t = window.__tsg, m = await import('/js/tunnels.js'), r = t.state.layout.routes[0], b = r.bridges[0]; return [m.dirtWidthAt(t.state.scene, r, 0, (b.s0 + b.s1) / 2, 1), m.dirtWidthAt(t.state.scene, r, 0, (b.s0 + b.s1) / 2, -1)]; });
+  expect(tw[0] === 7 && tw[1] === 5, `anchos propios del tramo: ${tw}`);
+});
+
+test('faldones: en «Geometría de la pista», con alto configurable', async () => {
+  const where = await ev(() => document.getElementById('skirts').closest('section').dataset.panel);
+  expect(where === 'trackmesh', `los faldones están en «${where}»`);
+  await page.click('#btnGenTerrain');
+  await idle();
+  await page.locator('#skirtHeightNum').fill('4'); await page.locator('#skirtHeightNum').dispatchEvent('change');
+  await idle();
+  expect((await ev(() => window.__tsg.state.scene.skirtHeight)) === 4, 'no se guardó el alto del faldón');
+});
+
+test('triggers: bocas de túneles y triggers propios (ubicar, renombrar, exportar)', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await addHill(0.3);
+  await idle();
+  let names = Object.values(await exportNames()).flat();
+  expect(names.includes('trigger_tunel_01_entrada') && names.includes('trigger_tunel_01_salida'), `triggers del túnel: ${names.filter((n) => n.startsWith('trigger'))}`);
+  // nuevo trigger: botón y clic en la pista
+  await ev(() => document.getElementById('btnTriggerNew').click());
+  const pt = await ev(() => { const r = window.__tsg.state.layout.routes[0], i = Math.floor(r.n * 0.8); return [r.x[i], r.y[i]]; });
+  const [sx, sy] = await mapXY(pt[0], pt[1]);
+  await page.mouse.click(sx, sy);
+  await idle();
+  const n = await ev(() => [window.__tsg.state.triggers.length, window.__tsg.state.selTrigger != null]);
+  expect(n[0] === 1 && n[1], `trigger propio creado: ${n}`);
+  await ev(() => { const i = document.querySelector('#triggerList .tgn'); i.value = 'Zona oscura'; i.dispatchEvent(new Event('change')); });
+  // arrastrarlo a lo largo de la pista
+  const p0 = await ev(() => window.__tsg.state.triggers[0].p.slice());
+  await drag(sx, sy, sx + 30, sy + 4);
+  const p1 = await ev(() => window.__tsg.state.triggers[0].p.slice());
+  expect(Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) > 3, `arrastrar el trigger: ${p0} → ${p1}`);
+  names = Object.values(await exportNames()).flat();
+  expect(names.includes('trigger_Zona_oscura'), `exporta el trigger propio: ${names.filter((n2) => n2.startsWith('trigger'))}`);
+  const ud = await ev(async () => { const t = window.__tsg, m = await import('/js/export-glb.js'); const { root } = await m.buildExportScene(t.state.layout, t.state.result, t.state.scene, { triggers: t.app.triggersWorld() }, null, t.app.hillsWorld(), null); let o = null; root.traverse((q) => { if (q.name === 'trigger_Zona_oscura') o = q; }); return o && [o.userData.trigger, o.material.opacity, o.material.name]; });
+  expect(ud && ud[0] === 'custom' && ud[1] === 0 && ud[2] === 'trigger', `trigger invisible con extras: ${ud}`);
+  await page.keyboard.press('Delete');
+  await idle();
+  expect((await ev(() => window.__tsg.state.triggers.length)) === 0, 'Supr no quitó el trigger');
+  await page.keyboard.press('Control+z');
+  await idle();
+  expect((await ev(() => window.__tsg.state.triggers.length)) === 1, 'deshacer no devolvió el trigger');
+});
+
+test('transiciones: subdividir y mover las divisiones sobre la textura', async () => {
+  await reset();
+  await makeTramo('track', [5, 6, 7, 8, 9]);
+  await ev(() => { const t = window.__tsg, b = t.state.project.main.bridges[0]; b.sameWidth = false; b.w = t.state.geom.width + 10; t.scheduleBuild(); });
+  await idle();
+  const tris = () => ev(() => window.__tsg.preview.trackGroup.children.reduce((a, m) => a + (m.geometry && m.geometry.index ? m.geometry.index.count / 3 : 0), 0));
+  const t1 = await tris();
+  await page.uncheck('#transSubdiv');
+  await idle();
+  const t0 = await tris();
+  expect(t1 > t0, `subdividir agrega triángulos (${t0} → ${t1})`);
+  await page.check('#transSubdiv');
+  await ev(() => document.getElementById('transDivBar').scrollIntoView());
+  const marks = await ev(() => document.querySelectorAll('#transDivBar .tdiv-mark').length);
+  expect(marks === 4, `4 divisiones por defecto: ${marks}`);
+  // arrastrar la primera marca
+  const r = await ev(() => { const m = document.querySelector('#transDivBar .tdiv-mark'), b = m.getBoundingClientRect(), bar = document.getElementById('transDivBar').getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2, bar.width]; });
+  await drag(r[0], r[1], r[0] + r[2] * 0.1, r[1]);
+  await idle();
+  const d0 = await ev(() => window.__tsg.state.scene.transDivs[0]);
+  expect(d0 > 0.12 && d0 < 0.22, `división movida: ${d0}`);
+  await page.click('#btnTransDivAdd');
+  expect((await ev(() => window.__tsg.state.scene.transDivs.length)) === 5, 'no se agregó la división');
+  await page.click('#btnTransDivDel');
+  await page.click('#btnTransDivReset');
+  const def = await ev(() => window.__tsg.state.scene.transDivs.join());
+  expect(def === '0.07,0.47,0.53,0.93', `por defecto: ${def}`);
+});
+
+test('auto 3D: se carga, se escala al tamaño del auto por defecto y se ajusta', async () => {
+  await reset();
+  await page.click('#btnGame');
+  await page.waitForFunction(() => window.__tsg.preview.game.active);
+  await page.setInputFiles('#fileCar', path.join(ROOT, 'test', 'assets', 'auto_prueba.glb'));
+  await page.waitForFunction(() => !!window.__tsg.preview.game.customCar, null, { timeout: 15000 });
+  const fit = await ev(async () => { const THREE = await import('three'); const g = window.__tsg.preview.game; g.car.updateMatrixWorld(true); const q = g.car.quaternion.clone(), p = g.car.position.clone(); g.car.quaternion.identity(); g.car.position.set(0, 0, 0); g.car.updateMatrixWorld(true); const b = new THREE.Box3().setFromObject(g.customCar), d = g.defaultBox(); g.car.quaternion.copy(q); g.car.position.copy(p); const s1 = b.getSize(new THREE.Vector3()), s2 = d.getSize(new THREE.Vector3()); return [s1.x, s1.y, s1.z, s2.x, s2.y, s2.z, b.min.z]; });
+  const inBox = fit[0] <= fit[3] + 1e-3 && fit[1] <= fit[4] + 1e-3 && fit[2] <= fit[5] + 1e-3;
+  const touches = Math.abs(fit[0] - fit[3]) < 1e-3 || Math.abs(fit[1] - fit[4]) < 1e-3 || Math.abs(fit[2] - fit[5]) < 1e-3;
+  expect(inBox && touches && Math.abs(fit[6]) < 1e-3, `escala automática: ${fit.map((v) => v.toFixed(2))}`);
+  const unlit = await ev(() => { const out = []; window.__tsg.preview.game.customCar.traverse((o) => { if (o.isMesh) out.push(o.material.type); }); return out; });
+  expect(unlit.length && unlit.every((t) => t === 'MeshBasicMaterial'), `auto con materiales unlit: ${unlit}`);
+  if (await ev(() => document.getElementById('carAdjBox').hidden)) await page.click('#btnCarAdj'); // se abre sola al cargar
+  await page.locator('#carDz').fill('0.5');
+  await page.locator('#carSz').fill('2');
+  const adj = await ev(() => { const g = window.__tsg.preview.game; return [g.customCar.position.z, window.__tsg.state.game.carAdj.sz, g.car.userData.body.visible]; });
+  expect(Math.abs(adj[0] - 0.5) < 1e-6 && adj[1] === 2 && adj[2] === false, `ajuste: ${adj}`);
+  const saved = await ev(() => { const d = window.__tsg.projectData(); return [!!d.carModel && d.carModel.name, d.game.carAdj.dz]; });
+  expect(saved[0] === 'auto_prueba.glb' && saved[1] === 0.5, `se guarda con el proyecto: ${saved}`);
+  await page.click('#btnCarRemove');
+  expect(await ev(() => !window.__tsg.preview.game.customCar && window.__tsg.preview.game.car.userData.body.visible), 'no volvió al auto por defecto');
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => !window.__tsg.preview.game.active);
+});
+
+test('pincel Suavizar pista: suaviza los puntos bajo el pincel sin Editar puntos', async () => {
+  await reset();
+  await tool('edit'); // crea los puntos de control
+  // un tramo de puntos seguidos bien a la vista en el mapa, con zigzag
+  const i0 = await ev(() => {
+    const t = window.__tsg, c = t.state.project.main.ctrl, r = document.getElementById('canvas2d').getBoundingClientRect();
+    const ok = (i) => { const [x, y] = t.editor.toScreen(c[i][0], c[i][1]); return x > 80 && y > 80 && x < r.width - 80 && y < r.height - 80; };
+    for (let i = 2; i < c.length - 9; i++) { let all = true; for (let j = i; j <= i + 6; j++) if (!ok(j)) all = false; if (all) return i; }
+    return 10;
+  });
+  const before = await ev((i0) => { const t = window.__tsg, c = t.state.project.main.ctrl, L = t.state.layout; for (let i = i0; i <= i0 + 6; i++) { const d = (i % 2 ? 1 : -1) * 3 / L.scale; c[i][0] += d; c[i][1] += d; } t.scheduleBuild(); return c.map((q) => q.slice(0, 2)); }, i0);
+  await idle();
+  await tool('tsmooth');
+  const vis = await ev(() => [!!document.getElementById('tsmoothBox').offsetParent, !!document.getElementById('paintSubMode').offsetParent]);
+  expect(vis[0] && !vis[1], `barra del pincel: ${vis}`);
+  const rough = (c) => { let s2 = 0; for (let i = i0 + 1; i <= i0 + 5; i++) s2 += Math.hypot(c[i - 1][0] + c[i + 1][0] - 2 * c[i][0], c[i - 1][1] + c[i + 1][1] - 2 * c[i][1]); return s2; };
+  const sc = await ev((i0) => { const t = window.__tsg, c = t.state.project.main.ctrl, r = document.getElementById('canvas2d').getBoundingClientRect(); return [i0 + 1, i0 + 5].map((i) => { const [x, y] = t.editor.toScreen(c[i][0], c[i][1]); return [x + r.left, y + r.top]; }); }, i0);
+  await page.locator('#tsmoothStrength').fill('1');
+  await drag(sc[0][0], sc[0][1], sc[1][0], sc[1][1], 8);
+  await drag(sc[1][0], sc[1][1], sc[0][0], sc[0][1], 8);
+  await idle();
+  const after = await ev(() => window.__tsg.state.project.main.ctrl.map((q) => q.slice(0, 2)));
+  const farI = (i0 + 30) % after.length;
+  const far = Math.hypot(after[farI][0] - before[farI][0], after[farI][1] - before[farI][1]);
+  expect(rough(after) < rough(before) * 0.6 && far < 1e-9, `suavizado: ${rough(before).toFixed(2)} → ${rough(after).toFixed(2)}, punto lejano movido ${far}`);
+  await ev(() => document.activeElement && document.activeElement.blur());
+  await page.keyboard.press('Control+z');
+  await idle();
+  const und = await ev(() => window.__tsg.state.project.main.ctrl.map((q) => q.slice(0, 2)));
+  expect(rough(und) > rough(after), 'deshacer no devolvió el trazo');
+  await page.keyboard.press('Escape');
+});
+
+test('nombre del proyecto y guardado automático en disco (carpeta, archivos por proyecto)', async () => {
+  await reset();
+  await page.locator('#projectName').fill('Prueba Auto');
+  await page.locator('#projectName').press('Enter');
+  const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#btnSave')]);
+  expect(dl.suggestedFilename() === 'Prueba_Auto.tsg.json', `guardar usa el nombre: ${dl.suggestedFilename()}`);
+  const dir = path.join(os.tmpdir(), `tsg-auto-${process.pid}`);
+  await ev((dir) => { const c = window.__tsg.asCfg(); c.dir = dir; c.keep = 2; }, dir);
+  for (let k = 0; k < 3; k++) {
+    await ev((k) => { const t = window.__tsg; t.state.project.main.pts[3][0] += 1 + k; }, k);
+    const ok = await ev(() => window.__tsg.autosaveNow(false));
+    expect(ok, `autoguardado ${k + 1} falló: ${await ev(() => document.getElementById('asInfo').textContent)}`);
+    await page.waitForTimeout(1100); // nombres con la hora (segundos)
+  }
+  expect(!(await ev(() => window.__tsg.autosaveNow(false))), 'sin cambios no debe guardar otra copia');
+  const fs = require('fs');
+  const files = fs.readdirSync(dir).filter((f) => f.startsWith('Prueba_Auto_auto_'));
+  expect(files.length === 2, `se conservan 2 archivos: ${files}`);
+  const d = JSON.parse(fs.readFileSync(path.join(dir, files[0]), 'utf8'));
+  expect(d.format === 'track-spline-generator' && d.projectName === 'Prueba Auto', 'el autoguardado no es un proyecto válido');
+  // también quedan en el navegador (IndexedDB), con el mismo límite por proyecto (así funciona en Vercel, sin servidor)
+  const idbN = await ev(async () => (await window.__tsg.idbAll()).filter((q) => q.name === 'Prueba_Auto').length);
+  expect(idbN === 2 && (await ev(() => window.__tsg.asServer())), `copias en el navegador: ${idbN}`);
+  // abrir autoguardado: la ventana de abrir lista las copias
+  await ev(() => window.__tsg.openAutosaves());
+  await page.waitForSelector('.open-dialog .od-card');
+  const cards = await ev(() => document.querySelectorAll('.open-dialog .od-card').length);
+  expect(cards === 2, `ventana con los autoguardados: ${cards}`);
+  await page.keyboard.press('Escape');
+  // seguridad: sin el encabezado de la app, el servidor no escribe
+  const code = (await fetch(new (require('url').URL)('/api/autosave/save?name=x', page.url()), { method: 'POST', body: '{}' })).status;
+  expect(code === 403, `pedido sin encabezado: ${code}`);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('modelos cargados: materiales unlit; la textura con transparencia se recorta como la hierba', async () => {
+  await reset();
+  await page.setInputFiles('#fileAssets', path.join(ROOT, 'test', 'assets', 'planta_alfa.glb'));
+  await page.waitForFunction(() => window.__tsg.state.assets.length === 1, null, { timeout: 15000 });
+  const m = await ev(() => { const A = window.__tsg.state.assets[0], mt = A.parts[0].material; return [mt.type, mt.alphaTest, mt.side, mt.transparent, !!mt.map]; });
+  expect(m[0] === 'MeshBasicMaterial' && m[1] === 0.5 && m[2] === 2 && m[3] === false && m[4], `material: ${m}`);
+  const ex = await ev(async () => { const t = window.__tsg, A = t.state.assets[0]; const { GLTFExporter } = await import('/vendor/exporters/GLTFExporter.js'); const THREE = await import('three'); const sc = new THREE.Scene(); sc.add(new THREE.Mesh(A.parts[0].geometry, A.parts[0].material)); const j = await new GLTFExporter().parseAsync(sc, { binary: false }); return [(j.extensionsUsed || []).join(), j.materials[0].alphaMode]; });
+  expect(ex[0].includes('KHR_materials_unlit') && ex[1] === 'MASK', `exportación unlit con recorte: ${ex}`);
+});
+
+test('guardado automático sin servidor (Vercel): en el navegador y en una carpeta elegida', async () => {
+  await reset();
+  await page.locator('#projectName').fill('Sin Servidor'); await page.locator('#projectName').press('Enter');
+  const r = await ev(async () => {
+    const t = window.__tsg;
+    t.setAsServer(false); // como en un hosting estático
+    const root = await navigator.storage.getDirectory(), dir = await root.getDirectoryHandle('auto-prueba', { create: true });
+    for await (const [n] of dir.entries()) await dir.removeEntry(n);
+    await t.setAsFolder(dir); // la carpeta elegida (aquí, una del propio navegador con la misma API)
+    t.asCfg().keep = 2;
+    for (let k = 0; k < 3; k++) { t.state.project.main.pts[2][0] += 1; await t.autosaveNow(false); await new Promise((res) => setTimeout(res, 1100)); }
+    const names = []; for await (const [n] of dir.entries()) names.push(n);
+    const idb = (await t.idbAll()).filter((q) => q.name === 'Sin_Servidor').length;
+    return [names.length, names.every((n) => /^Sin_Servidor_auto_\d{8}-\d{6}\.tsg\.json$/.test(n)), idb, !document.getElementById('asFolderRow').hidden, document.getElementById('asServerRow').hidden];
+  });
+  expect(r[0] === 2 && r[1] && r[2] === 2 && r[3] && r[4], `sin servidor: ${r}`);
+  await ev(() => window.__tsg.setAsServer(true));
+});
+
+test('guardar y abrir: el proyecto conserva tramos, cerros y listas fijas', async () => {
+  await reset();
+  await makeTramo('track', [5, 6, 7, 8, 9]);
+  await addHill(0.6);
+  await ev(() => document.getElementById('btnDecoNew').click());
+  await idle();
+  await ev(() => { window.__tsg.state.triggers = [{ id: 'tgx', name: 'uno', p: [100, 100], depth: 2, height: 6 }]; });
+  await ev(() => { const t = window.__tsg; t.state.scene.treeSingle = false; t.state.scene.treeBake = [[10, 10, 9, 2.5, 0, 1, 1, 0]]; t.state.decoSets[0].single = false; t.state.decoSets[0].bake = [[5, 5, 0, 1, 0.5]]; });
+  const back = await ev(async () => {
+    const t = window.__tsg, d = JSON.parse(JSON.stringify(t.projectData()));
+    await t.openProject(d);
+    await t.idle();
+    return [d.format, t.state.scene.treeBake && t.state.scene.treeBake.length, t.state.decoSets.length, t.state.decoSets[0] && Array.isArray(t.state.decoSets[0].bake), (t.state.project.main.bridges || []).length, t.state.hills.length, t.state.triggers.length];
+  });
+  expect(back[0] === 'track-spline-generator' && back[1] === 1 && back[2] === 1 && back[3] && back[4] === 1 && back[5] === 1 && back[6] === 1, `ida y vuelta: ${back}`);
+});
+
+test('exportar y guardar: Blender, 3ds Max, JSON, OBJ y el proyecto descargan su archivo', async () => {
+  await reset();
+  downloads = [];
+  await page.click('#btnExportMenu');
+  for (const id of ['btnExportBlender', 'btnExportMax', 'btnExportJSON', 'btnExportOBJ', 'btnSave']) {
+    const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 10000 }), ev((id) => document.getElementById(id).click(), id)]);
+    downloads.push(dl.suggestedFilename());
+  }
+  expect(downloads.some((n) => n.endsWith('.py')) && downloads.some((n) => n.endsWith('.ms')) && downloads.some((n) => n.endsWith('.json')) && downloads.some((n) => n.endsWith('.obj')) && downloads.includes('pista.tsg.json'), `descargas: ${downloads}`);
+  // cierra el menú (si quedara abierto, el Esc de la prueba siguiente lo cerraría a él y no saldría de la cámara de juego)
+  await page.keyboard.press('Escape');
+});
+
+test('cámara de juego: entra, oculta triggers, orbita (clic derecho restablece), brillo del auto y sale con Esc', async () => {
+  await sample('oval');
+  await page.click('#btnGame');
+  await page.waitForFunction(() => window.__tsg.preview.game && window.__tsg.preview.game.active);
+  const on = await ev(() => [window.__tsg.preview.game.active, window.__tsg.profile.gameS != null || !!window.__tsg.profile.hitCar]);
+  expect(on[0], 'no entró a la cámara de juego');
+  // «Ocultar triggers» (marcado por defecto): el grupo de triggers no se ve; al desmarcarlo vuelve
+  await page.waitForFunction(() => window.__tsg.preview.triggerGroup.visible === false);
+  expect(await page.locator('#gameHideTrig').isChecked(), 'Ocultar triggers debería venir marcado');
+  await page.locator('#gameHideTrig').uncheck();
+  await page.waitForFunction(() => window.__tsg.preview.triggerGroup.visible === true);
+  await page.locator('#gameHideTrig').check();
+  await page.waitForFunction(() => window.__tsg.preview.triggerGroup.visible === false);
+  // órbita: arrastrar con clic izquierdo gira alrededor del auto; clic derecho restablece
+  await ev(() => { document.getElementById('btnGamePause').click(); });
+  const box = await page.locator('#view3d').boundingBox();
+  const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+  const camBefore = await ev(() => window.__tsg.preview.game.camera.position.toArray());
+  await page.mouse.move(cx, cy); await page.mouse.down(); await page.mouse.move(cx + 160, cy + 10, { steps: 6 }); await page.mouse.move(cx + 220, cy + 40, { steps: 4 });
+  await page.waitForTimeout(150);
+  const orb = await ev(() => { const g = window.__tsg.preview.game; return [g.orbit.on, g.orbit.yaw, g.camera.position.toArray()]; });
+  await page.mouse.up();
+  const moved = Math.hypot(orb[2][0] - camBefore[0], orb[2][1] - camBefore[1]);
+  expect(orb[0] && orb[1] < -1 && moved > 3, `órbita: ${orb[0]} yaw ${orb[1]} movió ${moved.toFixed(1)} m`);
+  await page.mouse.click(cx, cy, { button: 'right' });
+  expect(await ev(() => { const g = window.__tsg.preview.game; return !g.orbit.on && g.orbit.yaw === 0 && g.orbit.pitch === 0; }), 'el clic derecho no restableció la cámara');
+  await ev(() => { document.getElementById('btnGamePause').click(); });
+  // rueda: cambia «Distancia» del ajuste de cámara
+  const d0 = await ev(() => window.__tsg.state.game.camDist);
+  await page.mouse.move(cx, cy); await page.mouse.wheel(0, 400); await page.waitForTimeout(100);
+  const d1 = await ev(() => [window.__tsg.state.game.camDist, document.getElementById('gameCamDist').value]);
+  expect(d1[0] > d0 + 1 && +d1[1] === d1[0], `rueda: distancia ${d0} → ${d1}`);
+  // derrape: en curva el auto gira hacia adentro (más a más velocidad); con Derrape 0 no
+  const drift = await ev(async () => {
+    const g = window.__tsg.preview.game, st = window.__tsg.state, r = st.layout.routes[0];
+    let sc = 0, best = 0; for (let i = 0; i < r.n; i++) if (Math.abs(r.k[i]) > best) { best = Math.abs(r.k[i]); sc = r.s[i]; }
+    g.paused = false; st.game.speed = 1; g.s = sc; g.driftYaw = 0;
+    const wait = () => new Promise((res) => setTimeout(res, 1200));
+    st.game.speed = 0.01; st.game.drift = 50; g.update(0.016);
+    // simula varios cuadros a 150 km/h en la curva
+    const run = (spd, amt) => { st.game.drift = amt; st.game.speed = spd; g.driftYaw = 0; for (let k = 0; k < 90; k++) { g.s = sc; g.update(1 / 60); } return g.driftAngle(); };
+    const a1 = run(150, 50), a0 = run(150, 0), aSlow = run(60, 50);
+    st.game.speed = 120; st.game.drift = 50;
+    return [a1, a0, aSlow, Math.sign(r.k[Math.round(sc / r.ds)])];
+  });
+  expect(Math.abs(drift[0]) > 0.15 && Math.sign(drift[0]) === drift[3] && Math.abs(drift[1]) < 1e-3 && Math.abs(drift[2]) < Math.abs(drift[0]), `derrape: ${drift.map((v) => v.toFixed(3))}`);
+  // brillo del auto (Ajuste auto 3D)
+  if (await page.locator('#carAdjBox').isHidden()) await page.click('#btnCarAdj');
+  const bri = await ev(() => {
+    const g = window.__tsg.preview.game, body = g.car.userData.body, r0 = body.material.color.r;
+    const el = document.getElementById('carBri'); el.value = '2'; el.dispatchEvent(new Event('input', { bubbles: true }));
+    const r2 = body.material.color.r;
+    document.getElementById('btnCarAdjReset').click();
+    return [r0, r2, body.material.color.r, document.getElementById('carBriVal').textContent];
+  });
+  expect(Math.abs(bri[1] - bri[0] * 2) < 1e-4 && Math.abs(bri[2] - bri[0]) < 1e-4 && bri[3] === '×1.00', `brillo: ${bri}`);
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => !window.__tsg.preview.game.active);
+});
+
+test('idioma: inglés al momento (textos, ayudas, avisos, lista de opciones) y vuelta a español', async () => {
+  if (!process.env.TSG_I18N) return; // traducciones: se revisan en las versiones finales (TSG_I18N=1)
+  await reset('figure8');
+  await page.click('#btnSettings');
+  await page.selectOption('#uiLang', 'en');
+  await page.waitForFunction(() => document.getElementById('btnNew').textContent.trim() === 'New');
+  const en = await ev(() => {
+    const txt = (id) => document.getElementById(id).textContent.replace(/\s+/g, ' ').trim();
+    const grp = document.querySelector('section.panel[data-group]').getAttribute('data-group');
+    const opt = [...document.getElementById('trackTexDir')?.options || []].map((o) => o.textContent)[0] || '';
+    return { newBtn: txt('btnNew'), game: txt('btnGame'), grp, opt, lang: localStorage.getItem('tsg.lang'), html: document.documentElement.lang, name: window.__tsg.state.projectName };
+  });
+  expect(en.newBtn === 'New' && en.game === 'Game camera' && en.grp === 'Input' && en.lang === 'en' && en.html === 'en', `inglés: ${JSON.stringify(en)}`);
+  await page.keyboard.press('Escape');
+  // globo de ayuda y aviso (toast) armados por el código
+  await page.hover('#btnFlatten');
+  const tip = await page.waitForFunction(() => { const t = document.querySelector('.hint-tip'); return t && !t.hidden && t.textContent; }).then((h) => h.jsonValue());
+  expect(/^Flattens the selected points/.test(tip), `globo: ${tip}`);
+  await ev(() => document.getElementById('btnFlatten').click());
+  const toastTxt = await ev(() => document.getElementById('toast').textContent);
+  expect(/^Select points/.test(toastTxt), `aviso: ${toastTxt}`);
+  // nada visible sin traducir (salvo nombres de datos)
+  const miss = await ev(() => window.__tsg.i18n.missingTexts().filter((s) => !/^(pista|track|figure8|tunel_|cerro_)/.test(s)));
+  expect(miss.length === 0, `sin traducir: ${miss.slice(0, 8).join(' | ')}`);
+  // y de vuelta a español
+  await ev(() => window.__tsg.i18n.setLang('es'));
+  const es = await ev(() => [document.getElementById('btnNew').textContent.trim(), document.querySelector('section.panel[data-group]').getAttribute('data-group'), localStorage.getItem('tsg.lang')]);
+  expect(es[0] === 'Nuevo' && es[1] === 'Entrada' && es[2] === 'es', `español: ${es}`);
+});
+
+test('buscador: Ctrl+K, herramientas, parámetros en paneles plegados, ventanas y cámara de juego', async () => {
+  await reset('figure8');
+  const go = async (q, i = 0) => {
+    await page.keyboard.press('Control+k');
+    await page.waitForFunction(() => document.activeElement && document.activeElement.id === 'searchBox');
+    await page.keyboard.type(q);
+    for (let k = 0; k < i; k++) await page.keyboard.press('ArrowDown');
+    const first = await ev(() => document.querySelector('#searchResults .sr-row.sel .sr-name')?.textContent || '');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(120);
+    return first;
+  };
+  // herramienta: se selecciona
+  let first = await go('esculpir');
+  expect(first === 'Esculpir relieve' && await ev(() => window.__tsg.state.tool === 'sculpt'), `herramienta: ${first}`);
+  await page.keyboard.press('Escape');
+  // parámetro en un panel plegado: se despliega y se ilumina
+  await ev(() => { const sec = document.querySelector('section.panel[data-panel="terrain"]'); if (!sec.classList.contains('collapsed')) sec.querySelector('button[data-act="collapse"]').click(); });
+  first = await go('largo playa');
+  const t1 = await ev(() => { const sec = document.querySelector('section.panel[data-panel="terrain"]'); return [sec.classList.contains('collapsed'), !!document.querySelector('.search-flash'), document.activeElement && document.activeElement.id]; });
+  expect(first === 'Largo de la playa' && !t1[0] && t1[1], `panel plegado: ${first} ${t1}`);
+  // sin tildes, con un error de tipeo y con sinónimo
+  const r = await ev(() => [window.__tsg.search.search('peraltr')[0]?.name, window.__tsg.search.search('autosave')[0]?.name, window.__tsg.search.search('camara juego')[0]?.name]);
+  expect(r[0] === 'Peralte' && r[1] === 'Guardado automático' && /Cámara de juego/.test(r[2]), `búsquedas: ${r}`);
+  // parámetro en una ventana: la abre
+  first = await go('tamano del texto');
+  expect(/Tamaño del texto/.test(first) && await ev(() => !document.getElementById('settingsPop').hidden), `ventana: ${first}`);
+  await page.keyboard.press('Escape');
+  // parámetro de la cámara de juego: entra a la cámara y abre «Ajuste auto 3D»
+  first = await go('brillo');
+  await page.waitForFunction(() => window.__tsg.preview.game && window.__tsg.preview.game.active);
+  expect(first === 'Brillo' && await ev(() => !document.getElementById('carAdjBox').hidden), `cámara de juego: ${first}`);
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => !window.__tsg.preview.game.active);
+  // en inglés busca en inglés (y también en español)
+  await ev(() => window.__tsg.i18n.setLang('en'));
+  const en = await ev(() => [window.__tsg.search.search('beach')[0]?.name, window.__tsg.search.search('playa')[0]?.name]);
+  expect(en[0] === 'Beach' && en[1] === 'Beach', `inglés: ${en}`);
+  await ev(() => window.__tsg.i18n.setLang('es'));
+});
+
+test('dibujar: en un circuito cerrado se redibuja el arco corto; una pista nueva siempre pregunta', async () => {
+  await reset('figure8');
+  const r = await ev(async () => {
+    const t = window.__tsg, m = t.state.project.main, P = m.ctrl || m.pts, n = P.length;
+    const i = Math.floor(n / 4), j = (i + 3) % n, a = P[i], c = P[j];
+    const tx = P[(i + 1) % n][0] - a[0], ty = P[(i + 1) % n][1] - a[1], tl = Math.hypot(tx, ty), nx = -ty / tl, ny = tx / tl;
+    // el trazo sale un poco hacia atrás (antes eso reemplazaba casi todo el circuito)
+    const S = [];
+    for (let k = 0; k <= 20; k++) { const u = k / 20, off = Math.sin(Math.PI * u) * 60, back = 30 * Math.sin(Math.PI * u) * (1 - u); S.push([a[0] + (c[0] - a[0]) * u + nx * off - (tx / tl) * back, a[1] + (c[1] - a[1]) * u + ny * off - (ty / tl) * back]); }
+    t.app.commitStroke('extend', S, 1);
+    await t.idle();
+    return [n, (t.state.project.main.ctrl || t.state.project.main.pts).length];
+  });
+  expect(r[1] > r[0] * 0.9, `redibujar: ${r[0]} → ${r[1]} puntos (no debe reemplazar el circuito)`);
+  // «Extender» desmarcado: dibujar una pista nueva pide confirmación aunque la pista no tenga trabajo encima
+  dialogs = [];
+  await ev(async () => { const t = window.__tsg; document.getElementById('drawExtend').checked = false; t.app.commitStroke('draw', [[0, 0], [50, 0], [50, 50], [0, 50]], 1); await t.idle(); document.getElementById('drawExtend').checked = true; });
+  expect(dialogs.some((m) => /reemplaza la ruta principal/.test(m)), `sin confirmación: ${dialogs}`);
+});
+
+test('río bajo un puente: el agua sigue por debajo del tablero (junto a la pista a nivel se corta)', async () => {
+  await reset();
+  await ev(() => document.querySelector('#elevMode button[data-mode=direct]').click());
+  await idle();
+  await makeTramo('bridge', [6, 7, 8, 9, 10]);
+  await ev(() => { const t = window.__tsg, zs = t.state.project.main.ctrlZ; for (let i = 6; i <= 10; i++) zs[i] = 9; t.scheduleBuild(); });
+  await page.click('#btnGenTerrain');
+  await idle();
+  const w = await ev(async () => {
+    const t = window.__tsg, L = t.state.layout, r = L.routes[0], b = r.bridges[0];
+    const across = (i, id) => { const i2 = (i + 1) % r.n, tx = r.x[i2] - r.x[i], ty = r.y[i2] - r.y[i], tl = Math.hypot(tx, ty), nx = -ty / tl, ny = tx / tl;
+      return { id, kind: 'river', mode: 'surface', depth: 2, walls: 'smooth', wallSubdiv: 2, strokes: [-30, -20, -10, 0, 10, 20, 30].map((o) => { const [x, y] = L.toLayout(r.x[i] + nx * o, r.y[i] + ny * o); return { x, y, r: 6 / L.scale, e: false }; }) }; };
+    const iB = Math.round(((b.s0 + b.s1) / 2) / r.ds) % r.n, iG = Math.round((b.s1 + 120) / r.ds) % r.n;
+    t.state.rivers = [across(iB, 1), across(iG, 2)];
+    t.preview.update(false); await t.idle();
+    // (0.76: el agua posada copia los triángulos del terreno: se mira si cubre puntos bajo la pista)
+    const near = (k, i) => {
+      const W = t.preview.riverMeshes[k]; if (!W) return -1;
+      const P = W.geometry.getAttribute('position'), I = W.geometry.getIndex().array;
+      let n = 0;
+      for (const [ox, oy] of [[0, 0], [1.5, 0], [-1.5, 0], [0, 1.5], [0, -1.5]]) {
+        const x = r.x[i] + ox, y = r.y[i] + oy;
+        for (let q = 0; q < I.length; q += 3) {
+          const [a, b, c] = [I[q], I[q + 1], I[q + 2]], ax = P.getX(a), ay = P.getY(a), bx = P.getX(b), by = P.getY(b), qx = P.getX(c), qy = P.getY(c);
+          const d = (by - qy) * (ax - qx) + (qx - bx) * (ay - qy); if (!d) continue;
+          const l1 = ((by - qy) * (x - qx) + (qx - bx) * (y - qy)) / d, l2 = ((qy - ay) * (x - qx) + (ax - qx) * (y - qy)) / d;
+          if (l1 >= 0 && l2 >= 0 && l1 + l2 <= 1) { n++; break; }
+        }
+      }
+      return n;
+    };
+    return [near(0, iB), near(1, iG), t.preview.riverMeshes.length];
+  });
+  expect(w[2] === 2 && w[0] >= 4 && w[1] === 0, `agua bajo el puente en ${w[0]} de 5 puntos; junto a la pista a nivel ${w[1]}`);
+});
+
+test('túneles: texturas de paredes y techo, decoración de pared (antorchas) y densidad mínima', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await addHill(0.3);
+  await idle();
+  await ev(() => window.__tsg.app.selectTunnel(0));
+  await page.waitForSelector('#tunnelList .tun-card.sel .tsDeco');
+  // decoración de pared: 3 por lado, a ambos lados
+  await page.check('#tunnelList .tun-card.sel .tsDeco');
+  await idle();
+  await ev(() => { const el = document.querySelector('#tunnelList .tun-card.sel .tsDecoNN'); el.value = '3'; el.dispatchEvent(new Event('change', { bubbles: true })); });
+  await idle();
+  const d = await ev(() => { const t = window.__tsg; const groups = new Set(t.preview.tunnelDecoMeshes.map((m) => m.parent)); return [groups.size, t.state.tunnelInfo[0].decoPlaced]; });
+  expect(d[0] === 6 && d[1] === 6, `antorchas en la vista: ${d}`);
+  // textura propia de las paredes (PNG) y general del techo
+  const png = Buffer.from(await ev(() => { const c = document.createElement('canvas'); c.width = c.height = 16; const g = c.getContext('2d'); g.fillStyle = '#a0522d'; g.fillRect(0, 0, 16, 16); return c.toDataURL('image/png').split(',')[1]; }), 'base64');
+  await ev(() => document.querySelector('#tunnelList .tun-card.sel .tsTexRow[data-kind="wall"] .tsTexLoad').click());
+  await page.setInputFiles('#tunnelList .tun-card.sel .tsTexFile', { name: 'ladrillo.png', mimeType: 'image/png', buffer: png });
+  await page.waitForFunction(() => { const i = window.__tsg.state.tunnelInfo[0]; return i && i.texUid && window.__tsg.state.tunnelTexOwn[i.texUid] && window.__tsg.state.tunnelTexOwn[i.texUid].wall; });
+  await page.setInputFiles('#tunCeilTexFile', { name: 'techo.png', mimeType: 'image/png', buffer: png });
+  await page.waitForFunction(() => !!window.__tsg.state.tunCeilTex);
+  await idle();
+  const m = await ev(() => { const T = window.__tsg.preview.tunnelMeshes; return [!!T[0].material.map, !!T[1].material.map]; });
+  expect(m[0] && m[1], `texturas en paredes y techo: ${m}`);
+  const names = Object.values(await exportNames()).flat();
+  expect(names.includes('tunel_01_paredes') && names.some((n) => /^tunel_01_decoracion/.test(n)), `exportación: ${names.filter((n) => /tunel_01/.test(n))}`);
+  // el proyecto guarda la textura propia y la decoración
+  const back = await ev(async () => { const t = window.__tsg, dd = JSON.parse(JSON.stringify(await t.projectData())); await t.openProject(dd); await t.idle(); const i = t.state.tunnelInfo[0]; return [!!(i.texUid && t.state.tunnelTexOwn[i.texUid] && t.state.tunnelTexOwn[i.texUid].wall), i.decoPlaced]; });
+  expect(back[0] && back[1] === 6, `guardar y abrir: ${back}`);
+  // densidad mínima (1 %): muchos menos triángulos que al 50 %
+  await ev(() => window.__tsg.app.selectTunnel(0));
+  await page.waitForSelector('#tunnelList .tun-card.sel .tsDenN');
+  const tri = async (v) => { await ev((v) => { const el = document.querySelector('#tunnelList .tun-card.sel .tsDenN'); el.value = String(v); el.dispatchEvent(new Event('change', { bubbles: true })); }, v); await idle(); return ev(() => window.__tsg.state.tunnelInfo[0].sections); };
+  const s50 = await tri(50), s1 = await tri(1);
+  expect(s1 < s50 / 4, `densidad mínima: ${s1} secciones (al 50 %: ${s50})`);
+});
+
+test('cerros: puntos de control (clic en el cerro, subir con la barra, mover en el mapa, Supr)', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await addHill(0.6, { hard: false, flat: 0.6, height: 20 });
+  await idle();
+  await ev(() => window.__tsg.app.selectHill(1));
+  await page.click('#btnHillCtrl');
+  // clic sobre el cerro en el mapa (su centro)
+  const c = await ev(() => { const h = window.__tsg.state.hills[0].strokes[0]; return [h.x, h.y]; });
+  const [sx, sy] = await ev(([x, y]) => { const t = window.__tsg, [a, b] = t.editor.toScreen(x, y), r = document.getElementById('canvas2d').getBoundingClientRect(); return [a + r.left, b + r.top]; }, c);
+  const hBefore = await ev(([x, y]) => { const t = window.__tsg, L = t.state.layout, [wx, wy] = L.toWorld(x, y); return t.preview.hillData.hillSample(1, wx, wy); }, c);
+  await page.mouse.click(sx, sy);
+  const n1 = await ev(() => (window.__tsg.state.hills[0].ctrl || []).length);
+  expect(n1 === 1 && await ev(() => window.__tsg.state.selHillCtrl === 0 && !document.getElementById('hillCtrlSel').hidden), `punto agregado: ${n1}`);
+  // subir 10 m con la barra
+  await ev(() => { const el = document.getElementById('hillCtrlDz'); el.value = '10'; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); });
+  await idle();
+  const hAfter = await ev(([x, y]) => { const t = window.__tsg, L = t.state.layout, [wx, wy] = L.toWorld(x, y); return t.preview.hillData.hillSample(1, wx, wy); }, c);
+  expect(hAfter - hBefore > 8, `sube el cerro: ${hBefore.toFixed(1)} → ${hAfter.toFixed(1)} m`);
+  expect(await ev(() => window.__tsg.preview.hillCtrlGroup.children.length === 1 && window.__tsg.preview.hctrlTc.enabled), 'esfera y gizmo del punto en 3D');
+  // arrastrarlo en el mapa lo mueve en planta
+  await setModeOff();
+  await drag(sx, sy, sx + 25, sy, 5);
+  await idle();
+  const moved = await ev(([x]) => window.__tsg.state.hills[0].ctrl[0].x - x, c);
+  expect(Math.abs(moved) > 0.5, `mover en planta: ${moved}`);
+  // Supr quita el punto (el cerro queda)
+  await ev(() => document.activeElement && document.activeElement.blur());
+  await page.keyboard.press('Delete');
+  await idle();
+  const after = await ev(() => [window.__tsg.state.hills.length, (window.__tsg.state.hills[0].ctrl || []).length]);
+  expect(after[0] === 1 && after[1] === 0, `Supr: ${after}`);
+});
+async function setModeOff() { await ev(() => { if (document.getElementById('btnHillCtrl').classList.contains('active')) document.getElementById('btnHillCtrl').click(); }); }
+
+test('selección: Ctrl+clic en 3D queda en amarillo; Shift+clic toma todos los puntos entre dos (mapa y 3D); Supr quita la imagen de referencia', async () => {
+  await reset();
+  await tool('edit');
+  const scr3d = (idx) => ev((idx) => { const t = window.__tsg, m = t.preview.handleGroup.children.find((q) => q.userData.key === 'main' && q.userData.idx === idx); const v = m.position.clone().project(t.preview.camera), r = t.preview.renderer.domElement.getBoundingClientRect(); return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; }, idx);
+  const yellow = () => ev(() => window.__tsg.preview.handleGroup.children.filter((m) => m.userData.key === 'main' && m.material.color.getHex() === 0xffe066).map((m) => m.userData.idx).sort((a, b) => a - b));
+  await selPts([]); await ev(() => { const t = window.__tsg; t.state.sel = { key: 'main', idx: 10 }; t.preview.updateHandles(); });
+  // Ctrl+clic en 3D en otros dos puntos
+  for (const i of [22, 30]) { const [x, y] = await scr3d(i); await page.keyboard.down('Control'); await page.mouse.click(x, y); await page.keyboard.up('Control'); } // lejos del gizmo del punto elegido
+  let yl = await yellow();
+  expect(JSON.stringify(yl) === '[10,22,30]', `Ctrl+clic en 3D: en amarillo ${yl}`);
+  // Shift+clic en 3D: rango desde el último elegido (30) hasta 34
+  { const [x, y] = await scr3d(34); await page.keyboard.down('Shift'); await page.mouse.click(x, y); await page.keyboard.up('Shift'); }
+  yl = await yellow();
+  expect(JSON.stringify(yl) === '[30,31,32,33,34]', `Shift+clic en 3D: ${yl}`);
+  // en el mapa, en un circuito cerrado toma el camino corto (pasando por el inicio)
+  const n = await ev(() => { const m = window.__tsg.state.project.main; return (m.ctrl || m.pts).length; });
+  await ev((n) => { const t = window.__tsg; t.app.clearMultiSel(); t.state.sel = { key: 'main', idx: n - 2 }; t.editor.draw(); t.preview.updateHandles(); }, n);
+  const [mx, my] = await ev(() => { const t = window.__tsg, P = t.state.project.main.ctrl || t.state.project.main.pts, [a, b] = t.editor.toScreen(P[2][0], P[2][1]), r = document.getElementById('canvas2d').getBoundingClientRect(); return [a + r.left, b + r.top]; });
+  await page.keyboard.down('Shift'); await page.mouse.click(mx, my); await page.keyboard.up('Shift');
+  const sel = await ev(() => [...(window.__tsg.state.selSet ? window.__tsg.state.selSet.idxs : [])].sort((a, b) => a - b));
+  expect(sel.length === 5 && sel.includes(0) && sel.includes(n - 1) && sel.includes(2), `Shift+clic en el mapa (camino corto): ${sel} de ${n}`);
+  // Supr con la herramienta «Referencia» quita la imagen; Ctrl+Z la devuelve
+  await ev(() => { const t = window.__tsg, c = document.createElement('canvas'); c.width = c.height = 32; t.state.ref = { canvas: c, w: 32, h: 32, x: 0, y: 0, scale: 1, opacity: 0.5, visible: true }; });
+  await tool('ref');
+  await ev(() => document.activeElement && document.activeElement.blur());
+  await page.keyboard.press('Delete');
+  expect(await ev(() => window.__tsg.state.ref === null), 'Supr no quitó la imagen de referencia');
+  await page.keyboard.press('Control+z');
+  await idle();
+  expect(await ev(() => !!(window.__tsg.state.ref && window.__tsg.state.ref.canvas)), 'Ctrl+Z no devolvió la imagen de referencia');
+});
+
+test('tramo socavado: paredes lisas extruidas desde la pista (malla y objeto propios) y nombres de los tipos', async () => {
+  await reset();
+  await ev(() => document.querySelector('#elevMode button[data-mode=direct]').click());
+  await idle();
+  await makeTramo('cut', [4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  await ev(() => { const t = window.__tsg, zs = t.state.project.main.ctrlZ; for (const i of [6, 7, 8, 9, 10]) zs[i] = -7; zs[5] = -3.5; zs[11] = -3.5; t.scheduleBuild(); });
+  await page.click('#btnGenTerrain');
+  await idle();
+  const w = await ev(() => { const T = window.__tsg.preview.terrainData; return [!!(T.cutWalls.art && T.cutWalls.art.extruded), T.cutWalls.art ? T.cutWalls.art.parts.length : 0]; });
+  expect(w[0] && w[1] === 1, `paredes lisas extruidas: ${w}`);
+  const names = Object.values(await exportNames()).flat();
+  expect(names.includes('socavado_01_paredes'), `exportación: ${names.filter((q) => /socav|muro/.test(q))}`);
+  const opts = await ev(() => [...document.querySelectorAll('#bridgeList .bwalls option')].map((o) => o.textContent));
+  expect(opts.includes('Lisas (extruidas de la pista)') && opts.includes('Naturales (del terreno)'), `tipos de pared: ${opts}`);
+});
+
+test('mapa: línea rosa en cada división de tramos; triggers en la barra de la vista 3D', async () => {
+  await reset();
+  await makeTramo('track', [5, 6, 7, 8, 9]);
+  await tool('pan');
+  const px = await ev(() => {
+    const t = window.__tsg, L = t.state.layout, r = L.routes[0], b = r.bridges[0], i = Math.round(b.s0 / r.ds) % r.n;
+    t.editor.draw();
+    const [lx, ly] = L.toLayout(r.x[i], r.y[i]), [sx, sy] = t.editor.toScreen(lx, ly), cv = document.getElementById('canvas2d'), k = cv.width / cv.getBoundingClientRect().width;
+    const d = cv.getContext('2d').getImageData(Math.round(sx * k), Math.round(sy * k), 1, 1).data;
+    return [d[0], d[1], d[2]];
+  });
+  expect(px[0] > 190 && px[1] < 150 && px[2] > 140, `línea rosa en la división: rgb ${px}`);
+  // check «Triggers» en la barra de la vista 3D (el mismo ajuste que el del panel)
+  await ev(() => { window.__tsg.state.triggers = [{ id: 'tg1', name: 'uno', p: [100, 100], depth: 2, height: 6 }]; });
+  await ev(() => { const el = document.getElementById('trigOn3d'); el.checked = false; el.dispatchEvent(new Event('change', { bubbles: true })); });
+  const off = await ev(() => [window.__tsg.state.scene.showTriggers, document.getElementById('showTriggers').checked, window.__tsg.preview.triggerGroup.children.length]);
+  expect(off[0] === false && off[1] === false && off[2] === 0, `ocultar triggers en 3D: ${off}`);
+  await ev(() => { const el = document.getElementById('trigOn3d'); el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); });
+  expect(await ev(() => window.__tsg.state.scene.showTriggers !== false && document.getElementById('showTriggers').checked), 'mostrar triggers de nuevo');
+});
+
+test('cerros: caja de edición (grilla, subir un punto, mover y agrandar la caja, filas y columnas)', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await addHill(0.6, { hard: false, flat: 0.6, height: 20 });
+  await idle();
+  await ev(() => window.__tsg.app.selectHill(1));
+  await page.click('#btnHillLat');
+  await idle();
+  const G0 = await ev(() => JSON.parse(JSON.stringify(window.__tsg.state.hills[0].lattice)));
+  expect(G0 && G0.nx === 4 && G0.ny === 4 && G0.dz.length === 16, `caja creada: ${JSON.stringify(G0)}`);
+  expect(await ev(() => window.__tsg.preview.hillCtrlGroup.children.some((o) => o.isLineSegments) && window.__tsg.preview.hillCtrlGroup.children.filter((o) => o.userData.hillLat != null).length === 16), 'líneas y 16 puntos de la caja en 3D');
+  // clic en el punto (1, 1) del mapa y subirlo 8 m con la barra
+  const scr = (x, y) => ev(([x, y]) => { const t = window.__tsg, [a, b] = t.editor.toScreen(x, y), r = document.getElementById('canvas2d').getBoundingClientRect(); return [a + r.left, b + r.top]; }, [x, y]);
+  const pL = await ev(() => window.__tsg.app.latPointL(window.__tsg.state.hills[0].lattice, 5));
+  const [sx, sy] = await scr(pL[0], pL[1]);
+  const hW = (p) => ev(([x, y]) => { const t = window.__tsg, [wx, wy] = t.state.layout.toWorld(x, y); return t.preview.hillData.hillSample(1, wx, wy); }, p);
+  const h0 = await hW(pL);
+  await page.mouse.click(sx, sy);
+  expect(await ev(() => window.__tsg.state.selHillLat === 5 && window.__tsg.preview.latTc.enabled), 'punto de la caja elegido (con gizmo en 3D)');
+  await ev(() => { const el = document.getElementById('hillLatDz'); el.value = '8'; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); });
+  await idle();
+  const h1 = await hW(pL);
+  expect(h1 - h0 > 6.5, `el cerro pasa por el punto: ${h0.toFixed(1)} → ${h1.toFixed(1)} m`);
+  // arrastrar el cuadrado del centro mueve la caja
+  const G1 = await ev(() => window.__tsg.state.hills[0].lattice);
+  const [cx, cy] = await scr((G1.x0 + G1.x1) / 2, (G1.y0 + G1.y1) / 2);
+  await drag(cx, cy, cx + 30, cy, 5);
+  await idle();
+  const G2 = await ev(() => window.__tsg.state.hills[0].lattice);
+  expect(Math.abs(G2.x0 - G1.x0) > 0.5 && Math.abs((G2.x1 - G2.x0) - (G1.x1 - G1.x0)) < 1e-6, `mover la caja: x0 ${G1.x0.toFixed(1)} → ${G2.x0.toFixed(1)}`);
+  // arrastrar el tirador de una esquina agranda la caja
+  const [hx, hy] = await ev(() => { const t = window.__tsg, G = t.state.hills[0].lattice, [x, y] = t.editor.latCornerHandles(G)[2], r = document.getElementById('canvas2d').getBoundingClientRect(); return [x + r.left, y + r.top]; });
+  await drag(hx, hy, hx + 25, hy + 25, 5);
+  await idle();
+  const G2b = await ev(() => window.__tsg.state.hills[0].lattice);
+  expect((G2b.x1 - G2b.x0) > (G2.x1 - G2.x0) + 0.5, `agrandar la caja: ancho ${(G2.x1 - G2.x0).toFixed(1)} → ${(G2b.x1 - G2b.x0).toFixed(1)}`);
+  // filas y columnas: 5 × 3 conserva la forma aproximada
+  await ev(() => { const a = document.getElementById('hillLatNx'), b = document.getElementById('hillLatNy'); a.value = '5'; b.value = '3'; a.dispatchEvent(new Event('change', { bubbles: true })); });
+  await idle();
+  const G3 = await ev(() => window.__tsg.state.hills[0].lattice);
+  expect(G3.nx === 5 && G3.ny === 3 && G3.dz.length === 15 && Math.max(...G3.dz) > 3, `filas y columnas: ${G3.nx} × ${G3.ny}, máx ${Math.max(...G3.dz)}`);
+  // se guarda en el proyecto y Ctrl+Z deshace
+  const back = await ev(async () => { const t = window.__tsg, d = JSON.parse(JSON.stringify(await t.projectData())); await t.openProject(d); await t.idle(); return t.state.hills[0].lattice && t.state.hills[0].lattice.nx; });
+  expect(back === 5, `guardar y abrir: ${back}`);
+  await ev(() => window.__tsg.app.selectHill(1));
+  await page.click('#btnHillLatDel');
+  await idle();
+  expect(await ev(() => !window.__tsg.state.hills[0].lattice), 'quitar caja');
+});
+
+test('camino de tierra: transición entre tramos de distinto ancho (barra en Bordes; 0 = corte)', async () => {
+  await reset();
+  await ev(() => { const sc = window.__tsg.state.scene; sc.dirtSide = 'both'; sc.dirtWidthL = 2; sc.dirtWidthR = 2; sc.dirtWidth = 2; });
+  await makeTramo('track', [5, 6, 7, 8, 9]);
+  await ev(() => { const t = window.__tsg, b = t.state.project.main.bridges[0]; b.dirt = true; b.dirtSide = 'both'; b.dirtOwnW = true; b.dirtWL = 9; b.dirtWR = 9; t.scheduleBuild(); });
+  await idle();
+  const w = await ev(async () => { const t = window.__tsg, m = await import('/js/tunnels.js'), r = t.state.layout.routes[0], b = r.bridges[0]; return [m.dirtWidthAt(t.state.scene, r, 0, b.s0 - 1, 1), m.dirtWidthAt(t.state.scene, r, 0, b.s0 + 6, 1), m.dirtWidthAt(t.state.scene, r, 0, b.s0 + 14, 1)]; });
+  expect(Math.abs(w[0] - 2) < 1e-6 && w[1] > 3 && w[1] < 8 && Math.abs(w[2] - 9) < 1e-6, `transición: ${w.map((v) => v.toFixed(2))}`);
+  await ev(() => { const el = document.getElementById('dirtTransitionNum'); el.value = '0'; el.dispatchEvent(new Event('change', { bubbles: true })); });
+  await idle();
+  const w0 = await ev(async () => { const t = window.__tsg, m = await import('/js/tunnels.js'), r = t.state.layout.routes[0], b = r.bridges[0]; return [t.state.scene.dirtTransition, document.getElementById('dirtTransition').value, m.dirtWidthAt(t.state.scene, r, 0, b.s0 + 1, 1)]; });
+  expect(w0[0] === 0 && w0[1] === '0' && Math.abs(w0[2] - 9) < 1e-6, `transición 0: ${w0}`);
+});
+
+test('tramo socavado: paredes con las secciones de la pista (en vivo), terreno de baja densidad sin triángulos sobre la pista y densidad solo en naturales', async () => {
+  await reset();
+  await ev(() => { const sc = window.__tsg.state.scene; sc.dirtSide = 'both'; sc.dirtWidthL = 8; sc.dirtWidthR = 8; sc.dirtWidth = 8; sc.trackMeshMode = 'optimized'; sc.trackDensity = 40; });
+  await ev(() => document.querySelector('#elevMode button[data-mode=direct]').click());
+  await idle();
+  await makeTramo('cut', [4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  await ev(() => { const t = window.__tsg, zs = t.state.project.main.ctrlZ; for (const i of [6, 7, 8, 9, 10]) zs[i] = -7; zs[5] = -3.5; zs[11] = -3.5; t.state.project.main.bridges[0].wallSubdiv = 1; t.scheduleBuild(); });
+  await page.click('#btnGenTerrain');
+  await ev(() => { const el = document.getElementById('terrainDensity'); el.value = '1'; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); });
+  await idle();
+  const res = await ev(async () => {
+    const t = window.__tsg, m = await import('/js/scene.js'), L = t.state.layout, E = t.state.result, sp = t.state.scene, T = t.preview.terrainData, r = L.routes[0];
+    const rows = new Set(m.trackRows(L, E, { ...sp, skirts: sp.terrain && sp.skirts })[0].map((q) => q % r.n));
+    const erows = new Set(m.trackRows(L, E, { ...sp, coveredRanges: t.preview.coveredCache || [] })[0].map((q) => q % r.n)); // camino de tierra y barrera
+    let own = 0, eown = 0, n = 0;
+    for (const w of T.ctx.cutStations) for (const q of w.rows) { if (q.extra) continue; n++; if (!rows.has(q.i)) own++; if (!erows.has(q.i)) eown++; }
+    // triángulos del terreno sobre la pista o el camino (en toda la zanja y unos metros antes y después)
+    const b = r.bridges.find((x) => x.type === 'cut'), S = T.ctx.S, P = T.positions, I = T.baseIndices;
+    let over = 0;
+    for (let k = 0; k < I.length; k += 3) {
+      const x = (P[I[k] * 3] + P[I[k + 1] * 3] + P[I[k + 2] * 3]) / 3, y = (P[I[k] * 3 + 1] + P[I[k + 1] * 3 + 1] + P[I[k + 2] * 3 + 1]) / 3, z = (P[I[k] * 3 + 2] + P[I[k + 1] * 3 + 2] + P[I[k + 2] * 3 + 2]) / 3;
+      let bi = 0, bd = Infinity;
+      for (let q = 0; q < r.n; q++) { const d = (r.x[q] - x) ** 2 + (r.y[q] - y) ** 2; if (d < bd) { bd = d; bi = q; } }
+      if (r.s[bi] < b.s0 - 15 || r.s[bi] > b.s1 + 15) continue;
+      const p = S[bi], u = (x - p.x) * -p.ty + (y - p.y) * p.tx;
+      if (u < p.uL - 0.1 && -u < p.uR - 0.1 && z > p.zc + p.sr * u + 0.05) over++;
+    }
+    return { n, own, eown, over, guides: T.cutGuides, adaptive: T.adaptive, stations: T.cutWalls.art.stations };
+  });
+  expect(res.n > 10 && res.own === 0 && res.eown <= 2 && res.over === 0 && res.guides > 50 && res.adaptive, `paredes y terreno: ${JSON.stringify(res)}`);
+  // 0.69: al cambiar la densidad o el modo de la pista, las paredes lisas se rehacen con las secciones nuevas
+  const stOf = () => ev(async () => {
+    const t = window.__tsg, m = await import('/js/scene.js'), L = t.state.layout, E = t.state.result, sp = t.state.scene, T = t.preview.terrainData, r = L.routes[0];
+    const rows = new Set(m.trackRows(L, E, { ...sp, skirts: sp.terrain && sp.skirts })[0].map((q) => q % r.n));
+    let own = 0, n = 0;
+    for (const w of T.ctx.cutStations) for (const q of w.rows) { if (q.extra) continue; n++; if (!rows.has(q.i)) own++; }
+    return { n, own };
+  });
+  const a0 = await stOf();
+  await ev(() => { const el = document.getElementById('trackDensity'); el.value = '100'; el.dispatchEvent(new Event('input', { bubbles: true })); });
+  await idle();
+  const a1 = await stOf();
+  await ev(() => document.querySelector('#trackMeshMode button[data-mode=uniform]').click());
+  await ev(() => { const el = document.getElementById('trackDensity'); el.value = '10'; el.dispatchEvent(new Event('input', { bubbles: true })); });
+  await idle();
+  const a2 = await stOf();
+  expect(a1.n > a0.n && a2.n < a1.n && a1.own === 0 && a2.own === 0, `paredes en vivo con la pista: ${JSON.stringify([a0, a1, a2])}`);
+  // «Densidad de las paredes» solo para paredes naturales
+  const vis = async () => ev(() => { const b = document.querySelector('#bridgeList .bwsBox'); return b ? !b.hidden : null; });
+  const vArt = await vis();
+  await ev(() => { const s = document.querySelector('#bridgeList .bwalls'); s.value = 'nat'; s.dispatchEvent(new Event('change', { bubbles: true })); });
+  await idle();
+  expect(vArt === false && (await vis()) === true, `densidad de paredes: lisas ${vArt}, naturales ${await vis()}`);
+});
+
+test('tramo socavado: inclinación de cada pared (gráfico del perfil) y textura propia de las paredes, con guardar y abrir', async () => {
+  await reset();
+  await ev(() => document.querySelector('#elevMode button[data-mode=direct]').click());
+  await idle();
+  await makeTramo('cut', [4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  await ev(() => { const t = window.__tsg, zs = t.state.project.main.ctrlZ; for (const i of [6, 7, 8, 9, 10]) zs[i] = -7; zs[5] = -3.5; zs[11] = -3.5; t.scheduleBuild(); });
+  await page.click('#btnGenTerrain');
+  await idle();
+  const q = (sel) => `#bridgeList .item[data-i="0"] ${sel}`;
+  const setRange = (sel, v) => ev(([sel, v]) => { const el = document.querySelector(sel); el.value = String(v); el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }, [sel, v]);
+  // enlazadas por defecto (90°): mover la barra cambia las dos
+  const d0 = await ev((s) => { const c = document.querySelector(s); const px = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0; for (let k = 3; k < px.length; k += 4) if (px[k]) n++; return [n, window.__tsg.state.scene.cutRanges[0].angL, window.__tsg.state.scene.cutRanges[0].angR]; }, q('.bangCv'));
+  expect(d0[0] > 2000 && d0[1] === 90 && d0[2] === 90, `gráfico y 90° por defecto: ${d0}`);
+  await setRange(q('.bangL'), 70);
+  await idle();
+  let cr = await ev(() => window.__tsg.state.scene.cutRanges[0]);
+  expect(cr.angL === 70 && cr.angR === 70, `enlazadas: ${cr.angL}/${cr.angR}`);
+  // independientes: derecha colgando sobre la pista
+  await ev((s) => { const el = document.querySelector(s); el.checked = false; el.dispatchEvent(new Event('change', { bubbles: true })); }, q('.bangLink'));
+  await setRange(q('.bangR'), 120);
+  await idle();
+  const g = await ev(() => { const t = window.__tsg, T = t.preview.terrainData, cr = t.state.scene.cutRanges[0]; return [cr.angL, cr.angR, T.ctx.cutStations.map((w) => +w.lean.toFixed(3))]; });
+  expect(g[0] === 70 && g[1] === 120 && g[2].includes(+(1 / Math.tan(70 * Math.PI / 180)).toFixed(3)) && g[2].includes(+(1 / Math.tan(120 * Math.PI / 180)).toFixed(3)), `ángulos por pared: ${JSON.stringify(g)}`);
+  // paredes naturales: rango 45–85°
+  await ev((s) => { const el = document.querySelector(s); el.value = 'nat'; el.dispatchEvent(new Event('change', { bubbles: true })); }, q('.bwalls'));
+  await idle();
+  const rn = await ev((s) => { const el = document.querySelector(s); return [el.min, el.max, el.value]; }, q('.bangL'));
+  expect(rn[0] === '45' && rn[1] === '85', `rango de las naturales: ${rn}`);
+  // textura propia de la roca de este tramo: su objeto y su material al exportar
+  await ev(() => { const c = document.createElement('canvas'); c.width = c.height = 8; c.getContext('2d').fillStyle = '#c0f'; c.getContext('2d').fillRect(0, 0, 8, 8); window.__tsg.app.setBridgeTexture(0, 'wallNat', c); });
+  await idle();
+  const pm = await ev(() => window.__tsg.preview.wallMeshes.filter((m) => m.userData.cutWall === 'nat').map((m) => [m.userData.cutIdx, !!m.material.map]));
+  expect(pm.length === 1 && pm[0][0] === 0 && pm[0][1], `roca con su textura en 3D: ${JSON.stringify(pm)}`);
+  const names = Object.values(await exportNames()).flat();
+  expect(names.includes('socavado_01_roca') && !names.includes('terreno_roca_socavada'), `exportación: ${names.filter((n) => /socav|roca/.test(n))}`);
+  // guardar y abrir: ángulos y textura propia
+  const back = await ev(async () => {
+    const t = window.__tsg, d = JSON.parse(JSON.stringify(t.projectData()));
+    await t.openProject(d);
+    await t.idle();
+    const b = t.state.project.main.bridges[0];
+    return [b.walls, JSON.stringify(b.natAng), JSON.stringify(b.artAng), b.angLink, !!t.app.cutWallOwnTex(0, 'nat')];
+  });
+  expect(back[0] === 'nat' && back[2] === '[70,120]' && back[3] === false && back[4], `ida y vuelta: ${back}`);
+});
+
+test('colisión: camino de tierra y costados (vista 3D, alto y grosor, exportación en «colision») y roca de las paredes naturales', async () => {
+  await reset('figure8');
+  await ev(() => { const sc = window.__tsg.state.scene; sc.dirtSide = 'both'; sc.dirtWidthL = 3; sc.dirtWidthR = 3; sc.dirtWidth = 3; window.__tsg.scheduleBuild(); });
+  await idle();
+  expect(await ev(() => window.__tsg.preview.collGroup.children.length === 0 && /Desactivada|Off/.test(document.getElementById('collInfo').textContent)), 'colisión apagada por defecto');
+  await ev(() => { const el = document.getElementById('collision'); el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); });
+  await idle();
+  await ev(() => { const el = document.getElementById('collHeightNum'); el.value = '9'; el.dispatchEvent(new Event('change', { bubbles: true })); });
+  const a = await ev(() => { const P = window.__tsg.preview; return [P.collGroup.children.map((m) => m.name), P.collGroup.visible, document.getElementById('collInfo').textContent]; });
+  expect(a[0].includes('colision_camino_tierra_ruta_principal') && a[0].filter((n) => /costados/.test(n)).length === 2 && a[1] && /quedan más bajas|are lower/.test(a[2]), `colisión en 3D: ${JSON.stringify(a)}`);
+  // contador: la colisión en otra línea, en celeste; «Colisiones» junto a «Triggers» en la barra de la vista 3D
+  const st = await ev(() => { const el = document.querySelector('.tri-stats .coll'), cb = document.getElementById('showCollision'); return [el ? el.textContent : null, el ? getComputedStyle(el).color : null, !cb.closest('.sidebar'), cb.closest('label').parentElement === document.getElementById('trigOn3d').closest('label').parentElement, cb.closest('label').textContent.trim()]; });
+  expect(st[0] && /Colisión|Collision/.test(st[0]) && st[1] === 'rgb(64, 224, 255)' && st[2] && st[3] && /^(Colisiones|Collisions)$/.test(st[4]), `contador y check: ${JSON.stringify(st)}`);
+  const tris = () => ev(() => window.__tsg.preview.collData.tris);
+  const t1 = await tris();
+  await ev(() => { const el = document.getElementById('collThickNum'); el.value = '0'; el.dispatchEvent(new Event('change', { bubbles: true })); });
+  const t0 = await tris();
+  expect(t0 < t1 / 2 && (await ev(() => window.__tsg.preview.collData.sides.every((m) => m.plane))), `grosor 0 = plano: ${t1} → ${t0}`);
+  await ev(() => { const el = document.getElementById('showCollision'); el.checked = false; el.dispatchEvent(new Event('change', { bubbles: true })); });
+  expect(await ev(() => window.__tsg.preview.collGroup.visible === false), 'ocultar en la vista 3D');
+  const ex = await exportNames();
+  expect(ex.colision && ex.colision.includes('colision_camino_tierra_ruta_principal') && ex.colision.filter((n) => /costados/.test(n)).length === 2, `exportación: ${JSON.stringify(ex.colision)}`);
+  // roca de las paredes naturales: sus controles solo con paredes naturales
+  await reset();
+  await ev(() => document.querySelector('#elevMode button[data-mode=direct]').click());
+  await idle();
+  await makeTramo('cut', [4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  await ev(() => { const t = window.__tsg, zs = t.state.project.main.ctrlZ; for (const i of [6, 7, 8, 9, 10]) zs[i] = -7; zs[5] = -3.5; zs[11] = -3.5; t.scheduleBuild(); });
+  await page.click('#btnGenTerrain');
+  await idle();
+  const q = (sel) => `#bridgeList .item[data-i="0"] ${sel}`;
+  expect(await ev((s) => document.querySelector(s).hidden, q('.bRockBox')), 'roca oculta con paredes lisas');
+  await ev((s) => { const el = document.querySelector(s); el.value = 'nat'; el.dispatchEvent(new Event('change', { bubbles: true })); }, q('.bwalls'));
+  await idle();
+  const g0 = await ev(() => window.__tsg.preview.terrainData.cutGuides);
+  await ev((s) => { const el = document.querySelector(s); el.value = 'sharp'; el.dispatchEvent(new Event('change', { bubbles: true })); }, q('.brStyle'));
+  await ev((s) => { const el = document.querySelector(s); el.value = '80'; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }, q('.brRough'));
+  await idle();
+  const g1 = await ev((s) => { const t = window.__tsg, c = t.state.scene.cutRanges[0]; return [c.rockStyle, c.rough, !document.querySelector(s).hidden, t.preview.terrainData.cutGuides]; }, q('.bRockBox'));
+  expect(g1[0] === 'sharp' && g1[1] === 80 && g1[2], `roca: ${JSON.stringify(g1)} (guías antes ${g0})`);
+});
+
+test('paredes del socavado: repetición X / Y y ajustes (generales y del tramo), ancho, caras exteriores y texturas de tapa y exterior', async () => {
+  await reset();
+  await ev(() => document.querySelector('#elevMode button[data-mode=direct]').click());
+  await idle();
+  await makeTramo('cut', [4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  await ev(() => { const t = window.__tsg, zs = t.state.project.main.ctrlZ; for (const i of [6, 7, 8, 9, 10]) zs[i] = -7; zs[5] = -3.5; zs[11] = -3.5; t.scheduleBuild(); });
+  await page.click('#btnGenTerrain');
+  await idle();
+  const q = (sel) => `#bridgeList .item[data-i="0"] ${sel}`;
+  // texturas al principio de la sección del socavado: interior, tapa y exterior (lisas)
+  const rows = await ev((s) => [...document.querySelectorAll(s)].map((b) => b.dataset.kind), q('.bcutBox button.btex'));
+  expect(JSON.stringify(rows) === JSON.stringify(['wallArt', 'wallArtTop', 'wallArtOut']), `filas de textura: ${rows}`);
+  // repetición general X / Y
+  const setNum = (sel, v) => ev(([sel, v]) => { const el = document.querySelector(sel); el.value = String(v); el.dispatchEvent(new Event('change', { bubbles: true })); }, [sel, v]);
+  await setNum('#cutWallTileXNum', 3); await setNum('#cutWallTileYNum', 1.5);
+  await idle();
+  const g = await ev(() => { const sc = window.__tsg.state.scene; return [sc.cutWallTileX, sc.cutWallTileY]; });
+  expect(g[0] === 3 && g[1] === 1.5, `repetición general: ${g}`);
+  // propia del tramo, ancho de la pared y caras exteriores
+  await ev((s) => { const el = document.querySelector(s); el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); }, q('.buvOwn'));
+  await setNum(q('.buvX'), 5);
+  await setNum(q('.bwallW'), 1.2);
+  // caras exteriores: se excluyen de la geometría (no solo se ocultan) y el contador de la vista 3D lo refleja
+  const triT = () => ev(() => [window.__tsg.preview.triCounts.terrain, window.__tsg.preview.wallMeshes.filter((m) => m.userData.cutPart === 'out').reduce((a, m) => a + m.geometry.getIndex().count / 3, 0)]);
+  await idle();
+  const tShow = await triT();
+  await ev((s) => { const el = document.querySelector(s); el.value = 'buried'; el.dispatchEvent(new Event('change', { bubbles: true })); }, q('.bouter'));
+  await idle();
+  const tBur = await triT();
+  expect(tBur[1] < tShow[1] && tShow[0] - tBur[0] === tShow[1] - tBur[1], `caras exteriores: ${JSON.stringify(tShow)} → ${JSON.stringify(tBur)} (contador y malla bajan lo mismo)`);
+  const c = await ev(() => { const t = window.__tsg, cr = t.state.scene.cutRanges[0], W = t.preview.terrainData.ctx.cutStations[0].rows[3]; return [cr.uvOwn, cr.tileX, cr.tileY, cr.wallW, cr.outer, +Math.hypot(W.ox - W.tx, W.oy - W.ty).toFixed(3)]; });
+  expect(c[0] === true && c[1] === 5 && c[2] === 1.5 && c[3] === 1.2 && c[4] === 'buried' && c[5] === 1.2, `tramo: ${JSON.stringify(c)}`);
+  // textura propia de la tapa: en 3D su malla, y al exportar la pared va por partes
+  await ev(() => { const cv = document.createElement('canvas'); cv.width = cv.height = 8; cv.getContext('2d').fillStyle = '#0f0'; cv.getContext('2d').fillRect(0, 0, 8, 8); window.__tsg.app.setBridgeTexture(0, 'wallArtTop', cv); });
+  await idle();
+  const pm = await ev(() => window.__tsg.preview.wallMeshes.filter((m) => m.userData.cutWall === 'art').map((m) => [m.userData.cutPart, !!m.material.map]));
+  expect(pm.some(([p, t]) => p === 'top' && t) && pm.some(([p, t]) => p === 'face' && !t), `mallas por parte: ${JSON.stringify(pm)}`);
+  const names = Object.values(await exportNames()).flat();
+  expect(names.includes('socavado_01_paredes') && names.includes('socavado_01_paredes_tapa') && names.includes('socavado_01_paredes_exterior'), `exportación por partes: ${names.filter((n) => /socav/.test(n))}`);
+  // sin texturas de tapa ni exterior, un solo objeto como antes
+  await ev(() => window.__tsg.app.setBridgeTexture(0, 'wallArtTop', null));
+  await idle();
+  const n2 = Object.values(await exportNames()).flat().filter((n) => /socavado_01_paredes/.test(n));
+  expect(JSON.stringify(n2) === JSON.stringify(['socavado_01_paredes']), `un objeto: ${n2}`);
+  // naturales: una sola fila de textura (la roca)
+  await ev((s) => { const el = document.querySelector(s); el.value = 'nat'; el.dispatchEvent(new Event('change', { bubbles: true })); }, q('.bwalls'));
+  await idle();
+  const rn = await ev((s) => [...document.querySelectorAll(s)].map((b) => b.dataset.kind), q('.bcutBox button.btex'));
+  expect(JSON.stringify(rn) === JSON.stringify(['wallNat']) && (await ev((s) => document.querySelector(s).hidden, q('.bArtBox'))), `naturales: ${rn}`);
+});
+
+test('perfil de elevación: atajo Automático / Directo sincronizado con el panel Elevación', async () => {
+  await reset();
+  const on = () => ev(() => [...document.querySelectorAll('#elevModeProf button.on, #elevMode button.on')].map((b) => b.dataset.mode).join(','));
+  expect((await on()) === 'auto,auto' || (await on()) === 'auto,auto', `automático por defecto: ${await on()}`);
+  await ev(() => document.querySelector('#elevModeProf button[data-mode=direct]').click());
+  await idle();
+  expect((await ev(() => window.__tsg.state.elev.mode)) === 'direct' && (await on()) === 'direct,direct', `directo desde el perfil: ${await on()}`);
+  await ev(() => document.querySelector('#elevMode button[data-mode=auto]').click());
+  await idle();
+  expect((await on()) === 'auto,auto', `vuelta a automático desde el panel: ${await on()}`);
+});
+
+test('ríos y lagos: lecho opcional, lago con agua plana, agua posada como el terreno o simplificada (tarjeta y exportación)', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await ev(async () => {
+    const t = window.__tsg, L = t.state.layout, r = L.routes[0];
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (let i = 0; i < r.n; i++) { x0 = Math.min(x0, r.x[i]); x1 = Math.max(x1, r.x[i]); y0 = Math.min(y0, r.y[i]); y1 = Math.max(y1, r.y[i]); }
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, P = (x, y, rr) => { const [a, b] = L.toLayout(x, y); return { x: a, y: b, r: rr / L.scale, e: false }; };
+    const riv = []; for (let q = 0; q <= 1; q += 0.02) riv.push(P(cx - 80 + 160 * q, cy + 15 * Math.sin(q * 6), 5));
+    const lake = []; for (let a = 0; a < 6.28; a += 0.3) for (const rr of [0, 8, 16]) lake.push(P(cx + Math.cos(a) * rr, cy + 60 + Math.sin(a) * rr, 8));
+    t.state.rivers = [{ id: 1, kind: 'river', mode: 'carved', depth: 2, walls: 'smooth', wallSubdiv: 2, strokes: riv }, { id: 2, kind: 'river', mode: 'carved', depth: 3, walls: 'smooth', wallSubdiv: 2, strokes: lake }];
+    t.app.riversChanged ? t.app.riversChanged() : t.preview.update(false);
+    await t.idle();
+  });
+  await ev(() => window.__tsg.preview.update(false));
+  await idle();
+  const q = (id, sel) => `#riverList .item[data-id="${id}"] ${sel}`;
+  const info = (id) => ev((s) => (document.querySelector(s) || {}).textContent || '', q(id, '.rinfo'));
+  const i1 = await info(1), i2 = await info(2);
+  expect(/^Río · Agua: \d/.test(i1) && /^Lago \(agua plana\) · Agua/.test(i2), `tarjetas: «${i1}» / «${i2}»`);
+  // lecho: su malla en 3D y su objeto al exportar
+  await ev((s) => { const el = document.querySelector(s); el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); }, q(1, '.rbed'));
+  await idle();
+  const beds = await ev(() => window.__tsg.preview.riverMeshes.filter((m) => m.userData.riverBed).map((m) => m.name));
+  expect(beds.length === 1 && /lecho/.test(beds[0]) && /Lecho: \d/.test(await info(1)), `lecho: ${beds} / ${await info(1)}`);
+  const ex = await exportNames();
+  expect(ex.rios && ex.rios.some((n) => /_lecho$/.test(n)), `exportación: ${JSON.stringify(ex.rios)}`);
+  // lago: rectángulo si es seguro
+  await ev((s) => { const el = document.querySelector(s); el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); }, q(2, '.rrect'));
+  await idle();
+  expect(/rectángulo/.test(await info(2)), `lago en rectángulo: ${await info(2)}`);
+  // posado: como el terreno → simplificada
+  await ev((s) => { const el = document.querySelector(s); el.value = 'surface'; el.dispatchEvent(new Event('change', { bubbles: true })); }, q(1, '.rmode'));
+  await idle();
+  const tTer = await ev(() => window.__tsg.preview.riverData.find((w) => w.id === 1).tris);
+  const vis = await ev(([a, b]) => [document.querySelector(a).hidden, document.querySelector(b).hidden], [q(1, '.rsurfOpts'), q(1, '.rcarvedOpts')]);
+  await ev((s) => { const el = document.querySelector(s); el.value = 'simple'; el.dispatchEvent(new Event('change', { bubbles: true })); }, q(1, '.rwmode'));
+  await idle();
+  const tSim = await ev(() => window.__tsg.preview.riverData.find((w) => w.id === 1).tris);
+  expect(!vis[0] && vis[1] && tSim < tTer, `posado: opciones ${vis}; como el terreno ${tTer} → simplificada ${tSim} triángulos`);
+});
+
+test('paredes de los ríos: lisas o naturales como los socavados (tarjeta, ángulo, texturas por parte, caras exteriores, exportación)', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await ev(async () => {
+    const t = window.__tsg, L = t.state.layout, r = L.routes[0];
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (let i = 0; i < r.n; i++) { x0 = Math.min(x0, r.x[i]); x1 = Math.max(x1, r.x[i]); y0 = Math.min(y0, r.y[i]); y1 = Math.max(y1, r.y[i]); }
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, P = (x, y, rr) => { const [a, b] = L.toLayout(x, y); return { x: a, y: b, r: rr / L.scale, e: false }; };
+    const riv = []; for (let q = 0; q <= 1; q += 0.02) riv.push(P(cx - 80 + 160 * q, cy + 15 * Math.sin(q * 6), 5));
+    t.state.rivers = [{ id: 1, kind: 'river', mode: 'carved', depth: 2.5, walls: 'smooth', wallSubdiv: 2, strokes: riv }]; // de un proyecto anterior: pasa a naturales
+    t.app.riversChanged();
+    await t.idle();
+  });
+  await idle();
+  const q = (sel) => `#riverList .item[data-id="1"] ${sel}`;
+  const setSel = (sel, v) => ev(([s, v]) => { const el = document.querySelector(s); el.value = v; el.dispatchEvent(new Event('change', { bubbles: true })); }, [q(sel), v]);
+  const walls = () => ev(() => window.__tsg.preview.wallMeshes.filter((m) => m.userData.riverWall).map((m) => `${m.userData.riverWall}:${m.userData.cutPart}`));
+  const card0 = await ev((s) => [document.querySelector(s + ' .rwalls').value, !document.querySelector(s + ' .rRockBox').hidden, !!document.querySelector(s + ' .rangCv')], '#riverList .item[data-id="1"]');
+  const w0 = await walls();
+  let names = Object.values(await exportNames()).flat();
+  expect(card0[0] === 'nat' && card0[1] && card0[2] && w0.includes('nat:face') && names.includes('rio_01_roca') && !names.includes('terreno_cauces'), `naturales (de «suaves»): tarjeta ${card0}, 3D ${w0}, exportación ${names.filter((n) => /rio|cauce/.test(n))}`);
+  // lisas: la tarjeta cambia, el ángulo y las caras exteriores rehacen la malla
+  await setSel('.rwalls', 'art');
+  await idle();
+  const card1 = await ev((s) => [!document.querySelector(s + ' .rArtBox').hidden, document.querySelectorAll(s + ' img.rthumb').length, +document.querySelector(s + ' .rang').max], '#riverList .item[data-id="1"]');
+  const w1 = await walls();
+  names = Object.values(await exportNames()).flat();
+  expect(card1[0] && card1[1] === 4 && card1[2] === 135 && ['art:face', 'art:top', 'art:out'].every((k) => w1.includes(k)) && names.includes('rio_01_paredes') && !names.includes('rio_01_roca'), `lisas: tarjeta ${card1}, 3D ${w1}, exportación ${names.filter((n) => /rio_/.test(n))}`);
+  await ev((s) => { const el = document.querySelector(s); el.value = 110; el.dispatchEvent(new Event('change', { bubbles: true })); }, q('.rang'));
+  await idle();
+  const ang = await ev(() => window.__tsg.state.rivers[0].artAng);
+  const triOut = () => ev(() => window.__tsg.preview.wallMeshes.filter((m) => m.userData.riverWall === 'art' && m.userData.cutPart === 'out').reduce((a, m) => a + m.geometry.index.count / 3, 0));
+  const o0 = await triOut();
+  await setSel('.router', 'hide');
+  await idle();
+  const o1 = await triOut();
+  expect(ang === 110 && o0 > 0 && o1 === 0, `ángulo ${ang}°; caras exteriores ${o0} → ocultas ${o1}`);
+  // textura propia de la tapa: se exporta aparte
+  await ev(() => { const c = document.createElement('canvas'); c.width = c.height = 8; c.getContext('2d').fillRect(0, 0, 8, 8); window.__tsg.app.setRiverTexture(1, 'wallArtTop', c); });
+  await idle();
+  names = Object.values(await exportNames()).flat();
+  const own = await ev((s) => !document.querySelector(s).disabled, q('.rtexRm[data-kind="wallArtTop"]'));
+  expect(own && names.includes('rio_01_paredes') && names.includes('rio_01_paredes_tapa'), `tapa con textura propia: ${own}, ${names.filter((n) => /rio_/.test(n))}`);
+});
+
+test('ríos: modo Línea (recta, encadenada, extremos rectos), Suavizar y Estabilizar; detalle del contorno', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await tool('river');
+  const setv = (id, v) => ev(([id, v]) => { const el = document.getElementById(id); if (el.type === 'checkbox') el.checked = v; else el.value = v; el.dispatchEvent(new Event('change', { bubbles: true })); el.dispatchEvent(new Event('input', { bubbles: true })); }, [id, v]);
+  await setv('riverMode', 'carved'); await setv('riverWalls', 'art'); await setv('riverShape', 'line');
+  const vis = await ev(() => ['riverLineCap', 'riverSmoothBox', 'riverStabBox'].map((id) => !document.getElementById(id).hidden));
+  const c = await ev(() => { const r = window.__tsg.state.layout.routes[0]; let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity; for (let i = 0; i < r.n; i++) { x0 = Math.min(x0, r.x[i]); x1 = Math.max(x1, r.x[i]); y0 = Math.min(y0, r.y[i]); y1 = Math.max(y1, r.y[i]); } return [(x0 + x1) / 2, (y0 + y1) / 2]; });
+  const A = await mapXY(c[0] - 50, c[1]), B = await mapXY(c[0] + 40, c[1] + 6), C = await mapXY(c[0] + 40, c[1] + 40);
+  await drag(A[0], A[1], B[0], B[1], 6);
+  await idle();
+  let st = await ev(() => window.__tsg.state.rivers.map((rv) => rv.strokes.map((q) => ({ ...q }))));
+  const walls1 = await ev(() => window.__tsg.preview.wallMeshes.filter((m) => m.userData.riverWall === 'art').length);
+  expect(vis[0] && !vis[1] && !vis[2] && st.length === 1 && st[0].length === 1 && Number.isFinite(st[0][0].x2) && walls1 > 0, `línea: opciones ${vis}, ${JSON.stringify(st)}, paredes ${walls1}`);
+  // encadenada desde el extremo, con extremos rectos: sigue desde el mismo punto y la unión queda redonda
+  await setv('riverLineCap', 'square');
+  const B2 = [B[0] + 3, B[1] + 2];
+  await drag(B2[0], B2[1], C[0], C[1], 6);
+  await idle();
+  st = await ev(() => window.__tsg.state.rivers.map((rv) => rv.strokes.map((q) => ({ ...q }))));
+  const [q1, q2] = st[0] || [];
+  expect(st.length === 1 && q2 && q2.x === q1.x2 && q2.y === q1.y2 && !q2.c0 && q2.c1 === 's' && !q1.c1, `encadenada: ${JSON.stringify(st)}`);
+  // suavizar: agrega toques de suavizado solo a los ríos que toca; en un lugar vacío no deja nada (ni un paso de deshacer)
+  await setv('riverShape', 'smooth');
+  const hid = await ev(() => ['riverMode', 'riverCarvedBox', 'riverStabBox', 'riverSmoothBox', 'paintEraseLbl'].map((id) => document.getElementById(id).hidden));
+  expect(hid[0] && hid[1] && hid[2] && !hid[3] && hid[4], `suavizar: solo el pincel y su fuerza en la barra (ocultos: ${hid})`);
+  const und0 = await ev(() => window.__tsg.undoLen());
+  const E0 = await mapXY(c[0] - 20, c[1] + 70), E1 = await mapXY(c[0] + 10, c[1] + 70);
+  await drag(E0[0], E0[1], E1[0], E1[1], 4);
+  await idle();
+  const und1 = await ev(() => window.__tsg.undoLen());
+  const S0 = await mapXY(c[0] + 38, c[1] + 3), S1 = await mapXY(c[0] + 44, c[1] + 12);
+  await drag(S0[0], S0[1], S1[0], S1[1], 5);
+  await idle();
+  st = await ev(() => window.__tsg.state.rivers.map((rv) => rv.strokes.map((q) => ({ ...q }))));
+  const nS = st[0].filter((q) => q.s).length;
+  expect(st.length === 1 && nS > 0 && und0 === und1, `suavizar: ${nS} toques de suavizado; en vacío deshacer ${und0} → ${und1}`);
+  // estabilizar: el trazo a pincel sigue al cursor con retraso (menos toques en un trazo corto)
+  const count = async (stab) => {
+    await ev(() => { const t = window.__tsg; t.state.rivers = []; t.app.riversChanged(); });
+    await setv('riverShape', 'brush'); await setv('riverStab', stab);
+    const P0 = await mapXY(c[0] - 40, c[1] - 30), P1 = await mapXY(c[0] + 20, c[1] - 30);
+    await drag(P0[0], P0[1], P1[0], P1[1], 30);
+    await idle();
+    return ev(() => { const rv = window.__tsg.state.rivers[0]; return rv ? [rv.strokes.length, Math.max(...rv.strokes.map((q) => q.x))] : [0, 0]; });
+  };
+  const n0 = await count(false), n1 = await count(true);
+  expect(n0[0] > 3 && n1[0] > 0 && n1[1] < n0[1], `estabilizar: sin ${n0}, con ${n1} (el último toque queda atrás del cursor)`);
+  await setv('riverStab', false);
+  // detalle del contorno en la tarjeta
+  const hasDet = await ev(() => !!document.querySelector('#riverList .item .rdet'));
+  expect(hasDet, 'detalle del contorno en la tarjeta');
+  // Supr borra el río seleccionado; Ctrl+Z lo devuelve
+  await tool('pan');
+  const nR0 = await ev(() => { const t = window.__tsg; t.app.selectRiver(t.state.rivers[0].id); return t.state.rivers.length; });
+  await ev(() => document.activeElement && document.activeElement.blur && document.activeElement.blur());
+  await page.keyboard.press('Delete');
+  await idle();
+  const nR1 = await ev(() => [window.__tsg.state.rivers.length, window.__tsg.state.selRiver]);
+  await page.keyboard.press('Control+z');
+  await idle();
+  const nR2 = await ev(() => window.__tsg.state.rivers.length);
+  expect(nR1[0] === nR0 - 1 && nR1[1] == null && nR2 === nR0, `Supr borra el río: ${nR0} → ${nR1[0]} → (Ctrl+Z) ${nR2}`);
+});
+
+test('señalética de curvas (en Elementos de pista): carteles por fuera de la curva, lista de curvas con tipo forzado, textura propia, sentido invertido y exportación', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  const setv = (id, v) => ev(([id, v]) => { const el = document.getElementById(id); if (el.type === 'checkbox') el.checked = v; else el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }, [id, v]);
+  // desde el menú «Elementos de pista ▾»: la activa y abre su sección (dentro del panel Elementos de pista)
+  await page.click('#btnItemsMenu');
+  await page.click('#btnTbSigns');
+  await idle();
+  const inItems = await ev(() => [!!document.querySelector('section.panel[data-panel="items"] #signs'), document.getElementById('signs').checked, !document.querySelector('section.panel[data-panel="signs"]')]);
+  expect(inItems.every(Boolean), `señalética en Elementos de pista, activada desde el menú: ${inItems}`);
+  const info = () => ev(() => { const t = window.__tsg, SG = t.preview.signData; return SG ? { n: SG.signs.length, types: SG.curves.map((c) => c.type), sides: [...new Set(SG.signs.map((q) => q.side))], meshes: t.preview.signGroup ? t.preview.signGroup.children.map((m) => `${m.userData.sign}:${m.userData.signPart}`) : [], rows: document.querySelectorAll('#signCurveList .sign-curve').length, stats: document.querySelector('.stats, #stats3d') ? document.querySelector('.stats, #stats3d').textContent : '' } : null; });
+  const a = await info();
+  expect(a && a.n >= 2 && a.types.every((x) => x === 'right') && a.sides.join() === 'left' && a.meshes.includes('right:sign') && a.meshes.includes('right:post') && a.rows === a.types.length, `carteles: ${JSON.stringify(a)}`);
+  // cantidad por curva
+  await setv('signCountNum', 3);
+  await idle();
+  const b = await info();
+  expect(b.n === a.n * 3, `cantidad por curva: ${a.n} → ${b.n}`);
+  // tipo forzado en la lista: la primera curva sin cartel
+  await ev(() => { const el = document.querySelector('#signCurveList .sign-curve .scType'); el.value = 'none'; el.dispatchEvent(new Event('change', { bubbles: true })); });
+  await idle();
+  const c = await info();
+  const ov = await ev(() => window.__tsg.state.scene.signOverrides.length);
+  expect(c.n === b.n - 3 && ov === 1 && c.types[0] === 'none', `sin cartel: ${c.n} carteles, ${ov} tipo(s) forzado(s), ${c.types}`);
+  // sentido invertido: curvas a la izquierda, carteles a la derecha (y el tipo forzado sigue en su lugar)
+  await setv('reverse', true);
+  await idle();
+  const d = await info();
+  expect(d.types.filter((x) => x !== 'none').every((x) => x === 'left') && d.types.includes('none') && d.sides.join() === 'right', `sentido invertido: ${JSON.stringify(d)}`);
+  await setv('reverse', false);
+  await idle();
+  // textura propia de la curva a la derecha: el material del cartel la usa
+  const same = await ev(async () => {
+    const t = window.__tsg, c = document.createElement('canvas'); c.width = c.height = 8; c.getContext('2d').fillRect(0, 0, 8, 8);
+    t.state.signTexRight = c; t.app.sceneChanged ? t.app.sceneChanged() : t.preview.update(false); await t.idle();
+    const m = t.preview.signGroup.children.find((o) => o.userData.sign === 'right' && o.userData.signPart === 'sign');
+    return !!(m && m.material.map && m.material.map.image === c);
+  });
+  expect(same, 'la textura propia de «curva a la derecha» va en su cartel');
+  // clic en un cartel (mapa, con Navegar): abre la señalética y resalta su curva en la lista
+  await tool('pan');
+  const mk = await ev(() => { const m = window.__tsg.app.signMarkersL(); return m[m.length - 1]; });
+  const [mx, my] = await ev(([x, y]) => { const t = window.__tsg, [sx, sy] = t.editor.toScreen(x, y), r = document.getElementById('canvas2d').getBoundingClientRect(); return [sx + r.left, sy + r.top]; }, [mk.x, mk.y]);
+  await page.mouse.click(mx, my);
+  await idle();
+  const foc = await ev(() => { const t = window.__tsg, row = document.querySelector('#signCurveList .sign-curve.sel'); return [t.state.selSignCurve, row ? +row.dataset.i : null]; });
+  expect(foc[0] === mk.curve && foc[1] === mk.curve, `clic en un cartel: curva ${mk.curve}, seleccionada ${foc}`);
+  // clic en un cartel en 3D: lo mismo (por el rayo, sobre el plano del cartel)
+  const q0 = await ev(() => { const t = window.__tsg, P = t.preview, q = P.signData.signs[0], H = t.state.scene.signHeight; t.state.selSignCurve = null;
+    P.controls.target.set(q.x + q.nx * 0.02, q.y + q.ny * 0.02, q.z + H); P.camera.position.set(q.x + q.nx * 7, q.y + q.ny * 7, q.z + H); P.controls.update(); P.needsFrame = true; return q.curve; });
+  await idle();
+  const vb = await page.locator('#view3d').boundingBox();
+  await page.mouse.click(vb.x + vb.width / 2, vb.y + vb.height / 2);
+  await idle();
+  const foc3 = await ev(() => window.__tsg.state.selSignCurve);
+  expect(foc3 === q0, `clic en un cartel en 3D: curva ${q0}, seleccionada ${foc3}`);
+  // buscador justo después de «Exportar»
+  const sp = await ev(() => { const a = document.getElementById('btnExportMenu').getBoundingClientRect(), b = document.getElementById('searchWrap').getBoundingClientRect(); return [Math.round(b.left - a.right), Math.abs((a.top + a.bottom) / 2 - (b.top + b.bottom) / 2) < 6]; });
+  expect(sp[0] >= 0 && sp[0] < 40 && sp[1], `buscador después de Exportar: ${sp}`);
+  const names = Object.values(await exportNames()).flat();
+  expect(names.includes('senaletica') || names.includes('senal_curva_der'), `exportación: ${names.filter((n) => /senal/.test(n))}`);
+  const ex = await exportNames();
+  expect(ex.senaletica && ex.senaletica.includes('senal_curva_der') && ex.senaletica.includes('senal_curva_der_postes'), `grupo senaletica: ${JSON.stringify(ex.senaletica)}`);
+});
+
+test('agua: textura a lo largo de la corriente, lagos aparte, textura propia, invertir corriente, segunda capa y cascada al pintar sobre un cerro', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await ev(async () => {
+    const t = window.__tsg, L = t.state.layout, r = L.routes[0];
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (let i = 0; i < r.n; i++) { x0 = Math.min(x0, r.x[i]); x1 = Math.max(x1, r.x[i]); y0 = Math.min(y0, r.y[i]); y1 = Math.max(y1, r.y[i]); }
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, P = (x, y, rr) => { const [a, b] = L.toLayout(x, y); return { x: a, y: b, r: rr / L.scale, e: false }; };
+    const riv = []; for (let q = 0; q <= 1; q += 0.02) riv.push(P(cx - 80 + 160 * q, cy + 15 * Math.sin(q * 6), 5));
+    const lake = []; for (let a = 0; a < 6.28; a += 0.3) for (const rr of [0, 8, 16]) lake.push(P(cx + Math.cos(a) * rr, cy + 60 + Math.sin(a) * rr, 8));
+    t.state.rivers = [{ id: 1, kind: 'river', mode: 'carved', depth: 2, walls: 'nat', wallSubdiv: 2, strokes: riv }, { id: 2, kind: 'river', mode: 'carved', depth: 3, walls: 'nat', wallSubdiv: 2, strokes: lake }];
+    t.app.riversChanged(); await t.idle();
+  });
+  await idle();
+  const q = (id, sel) => `#riverList .item[data-id="${id}"] ${sel}`;
+  const st = () => ev(() => window.__tsg.preview.riverMeshes.filter((m) => m.userData.waterLayer).map((m) => ({ id: m.userData.riverId, layer: m.userData.waterLayer, name: m.name, map: !!m.material.map })));
+  const w0 = await st(), cats = await ev(() => window.__tsg.preview.riverData.map((w) => w.cat).join());
+  const flipVis = await ev(([a, b]) => [!document.querySelector(a).hidden, !document.querySelector(b).hidden], [q(1, '.rflipBox'), q(2, '.rflipBox')]);
+  expect(cats === 'river,lake' && w0.length === 2 && w0.every((m) => m.map) && flipVis[0] && !flipVis[1], `agua con textura: ${cats}, ${JSON.stringify(w0)}; «Invertir corriente» solo en el río: ${flipVis}`);
+  // invertir corriente: la v cambia de signo
+  const v0 = await ev(() => window.__tsg.preview.riverData[0].uvs[1]);
+  await ev((s) => { const el = document.querySelector(s); el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); }, q(1, '.rflip'));
+  await idle();
+  const v1 = await ev(() => [window.__tsg.state.rivers[0].flipFlow, window.__tsg.preview.riverData[0].uvs[1]]);
+  expect(v1[0] === true && Math.abs(v1[1] + v0) < 1e-4, `invertir corriente: v ${v0.toFixed(3)} → ${v1[1].toFixed(3)}`);
+  // segunda capa (0.89: de cada río, en su tarjeta): el río la tiene, el lago no; se exporta aparte
+  await ev((c) => { const el = document.querySelector(c); el.value = '1'; el.dispatchEvent(new Event('change', { bubbles: true })); }, q(1, '.rw2'));
+  await idle();
+  const w2 = await st();
+  const ex = await exportNames();
+  expect(w2.some((m) => m.id === 1 && m.layer === 2) && !w2.some((m) => m.id === 2 && m.layer === 2) && ex.rios && ex.rios.includes('rio_01_capa2') && !ex.rios.includes('rio_02_capa2'), `segunda capa: ${JSON.stringify(w2)}; exportación ${JSON.stringify(ex.rios)}`);
+  // textura propia del río: su malla la usa
+  const own = await ev(async () => {
+    const t = window.__tsg, c = document.createElement('canvas'); c.width = c.height = 8; c.getContext('2d').fillRect(0, 0, 8, 8);
+    t.app.setRiverTexture(1, 'water', c); await t.idle();
+    const m = t.preview.riverMeshes.find((o) => o.userData.riverId === 1 && o.userData.waterLayer === 1);
+    return !!(m && m.material.map && m.material.map.image === c) && !document.querySelector('#riverList .item[data-id="1"] .rwtexRm[data-kind="water"]').disabled;
+  });
+  expect(own, 'textura propia del agua del río');
+  // pintar un río que empieza sobre un cerro (sin seleccionarlo): cascada de ese cerro
+  await addHill(0.3);
+  await idle();
+  await ev(() => { const t = window.__tsg; t.state.rivers = []; t.app.selectHill(null); t.app.riversChanged(); });
+  await tool('river');
+  await ev(() => { const el = document.getElementById('riverShape'); el.value = 'brush'; el.dispatchEvent(new Event('change', { bubbles: true })); });
+  const hc = await ev(() => { const h = window.__tsg.state.hills[0].strokes[0]; return [h.x, h.y]; });
+  const A = await ev(([x, y]) => { const t = window.__tsg, [sx, sy] = t.editor.toScreen(x, y), r = document.getElementById('canvas2d').getBoundingClientRect(); return [sx + r.left, sy + r.top]; }, hc);
+  await drag(A[0], A[1], A[0] + 25, A[1] + 10, 5);
+  await idle();
+  const f = await ev(() => { const t = window.__tsg, rv = t.state.rivers[0]; return rv ? [rv.kind, rv.hill, document.querySelector('#riverList .item strong').textContent] : null; });
+  expect(f && f[0] === 'fall' && f[1] === 1 && /^cascada_/.test(f[2]), `río que empieza sobre un cerro: ${f}`);
+  // proyecto anterior con un río pintado sobre el cerro: al abrirlo pasa a ser cascada
+  const mig = await ev(async () => {
+    const t = window.__tsg, d = JSON.parse(JSON.stringify(t.projectData()));
+    d.rivers = d.rivers.map((rv) => ({ ...rv, kind: 'river', hill: null, walls: 'nat' }));
+    await t.openProject(d); await t.idle();
+    return t.state.rivers.map((rv) => `${rv.kind}:${rv.hill}`).join();
+  });
+  expect(mig === 'fall:1', `al abrir: río sobre el cerro → ${mig}`);
+});
+
+test('tarjetas: la primera vez que se abre una lista desplegable no se cierra (la tarjeta no se vuelve a dibujar)', async () => {
+  await reset();
+  await makeTramo('cut', [5, 6, 7, 8, 9]);
+  await ev(() => { window.__tsg.app.selectBridge ? window.__tsg.app.selectBridge(null) : (window.__tsg.state.selBridge = null); });
+  await idle();
+  const box = await ev(() => { const s = document.querySelector('#bridgeList .item select'); s.scrollIntoView({ block: 'center' }); s.dataset.probe = '1'; const r = s.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; });
+  await page.mouse.click(box[0], box[1]);
+  await page.waitForTimeout(150);
+  const st = await ev(() => { const s = document.querySelector('#bridgeList select[data-probe="1"]'); return [!!s, document.activeElement === s]; });
+  await page.keyboard.press('Escape');
+  expect(st[0] && st[1], `la lista sigue abierta tras el primer clic: ${st}`);
+});
+
+test('barra lateral 0.84: Elevación, Cruces y Peralte en «Forma de la pista», «Juego» al final, icono de pestaña y flechas grandes', async () => {
+  await reset();
+  const g = await ev(() => {
+    const secs = [...document.querySelectorAll('#sidebar > section.panel[data-panel]')];
+    const groups = secs.filter((q) => q.dataset.group).map((q) => q.dataset.group);
+    const groupOf = (id) => { let cur = null; for (const q of secs) { if (q.dataset.group) cur = q.dataset.group; if (q.dataset.panel === id) return cur; } return null; };
+    const fs = (sel) => parseFloat(getComputedStyle(document.querySelector(sel)).fontSize);
+    return { groups, elev: groupOf('elev'), cross: groupOf('cross'), bank: groupOf('bank'), game: ['gate', 'items', 'triggers', 'sky'].map(groupOf), last: secs[secs.length - 1].dataset.panel,
+      icon: !!document.querySelector('link[rel=icon][href^="data:image/svg"]'), arrow: fs('section.panel .pbtn[data-act=collapse]'), coll: fs('#treesBlock .coll-arrow') };
+  });
+  expect(JSON.stringify(g.groups) === JSON.stringify(['Entrada', 'Forma de la pista', 'Aspecto de la pista', 'Terreno', 'Vegetación y decoración', 'Juego']), `grupos: ${g.groups}`);
+  expect(g.elev === 'Forma de la pista' && g.cross === g.elev && g.bank === g.elev && g.game.every((x) => x === 'Juego') && g.last === 'sky', `secciones: ${JSON.stringify(g)}`);
+  expect(g.icon && g.arrow >= 20 && g.coll >= 20, `icono ${g.icon}, flechas ${g.arrow} / ${g.coll} px`);
+  // el atajo Automático / Directo del perfil despliega «Elevación» en la barra lateral y la marca
+  await ev(() => { const sec = document.querySelector('section.panel[data-panel="elev"]'); if (!sec.classList.contains('collapsed')) sec.querySelector('.pbtn[data-act=collapse]').click(); document.getElementById('sidebar').scrollTop = 0; });
+  await ev(() => document.querySelector('#elevModeProf button[data-mode=direct]').click());
+  await idle();
+  await page.waitForTimeout(900);
+  const f = await ev(() => { const sb = document.getElementById('sidebar'), sec = document.querySelector('section.panel[data-panel="elev"]'), r = sec.getBoundingClientRect(), R = sb.getBoundingClientRect(); return [sec.classList.contains('collapsed'), sec.classList.contains('focus-ring'), r.top >= R.top - 2 && r.top < R.bottom - 40, window.__tsg.state.elev.mode]; });
+  expect(!f[0] && f[1] && f[2] && f[3] === 'direct', `perfil → Elevación desplegada y a la vista: ${f}`);
+});
+
+test('árboles y hierba 0.84: single mesh apaga la distribución, grupos independientes, sombra y textura por grupo', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await page.click('#btnGenTrees');
+  await idle();
+  const st = () => ev(() => { const $ = (id) => document.getElementById(id); return { dens: $('treeDensity').disabled, side: $('treeSide').disabled, slopes: $('treeOnSlopes').disabled, scale: $('treeScale').disabled, reset: $('btnTreeReset').disabled, resetHidden: $('btnTreeReset').hidden, bake: Array.isArray(window.__tsg.state.scene.treeBake) }; });
+  let s = await st();
+  expect(!s.dens && !s.side && !s.slopes && !s.scale && s.reset && !s.resetHidden && !s.bake, `single mesh: deslizadores activos y Restablecer apagado ${JSON.stringify(s)}`);
+  await page.uncheck('#treeSingle');
+  await idle();
+  s = await st();
+  expect(s.dens && s.side && s.slopes && !s.scale && !s.reset && s.bake, `sin single mesh: distribución apagada, escala y Restablecer activos ${JSON.stringify(s)}`);
+  await page.check('#treeSingle'); // sin editar nada: vuelve a la distribución automática
+  await idle();
+  s = await st();
+  expect(!s.dens && s.reset && !s.bake, `volver sin editar: ${JSON.stringify(s)}`);
+  await page.uncheck('#treeSingle');
+  await idle();
+  await ev(() => { const t = window.__tsg; t.app.selectVeg({ kind: 'tree', set: null, i: 2 }); });
+  await page.click('#btnTreeDel');
+  await idle();
+  await page.check('#treeSingle'); // editado a mano: queda fijo, Restablecer activo y se avisa
+  await idle();
+  s = await st();
+  const toastTxt = await ev(() => document.body.innerText.includes('«Restablecer» vuelve a la automática'));
+  expect(s.dens && !s.reset && s.bake && toastTxt, `editado a mano: ${JSON.stringify(s)} aviso ${toastTxt}`);
+  await page.click('#btnTreeReset');
+  await idle();
+  s = await st();
+  expect(!s.dens && s.reset && !s.bake, `Restablecer: ${JSON.stringify(s)}`);
+  // grupo nuevo de árboles: pestañas, parámetros propios, exportación aparte y deshacer
+  const n0 = await ev(() => window.__tsg.preview.treeData.length);
+  await page.click('#btnTreeGroupNew');
+  await idle();
+  let gi = await ev(() => { const sc = window.__tsg.state.scene; return [sc.treeGroups.length, sc.treeGroupSel, document.querySelectorAll('#treeGroupTabs .gtab').length, document.querySelector('#treeGroupTabs .gtab.on').textContent, sc.trees]; });
+  expect(gi[0] === 2 && gi[1] === 1 && gi[2] === 2 && gi[3] === 'Árboles 2' && gi[4], `grupo nuevo: ${gi}`);
+  await page.selectOption('#treeSide', 'right');
+  await idle();
+  await ev(() => { const el = document.getElementById('treeScale'); el.value = 1.6; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); });
+  await idle();
+  const cnt = await ev(() => [window.__tsg.preview.treeData.length, (window.__tsg.preview.treeMeshesOther || []).length]);
+  expect(cnt[0] > 3 && cnt[1] === 1, `árboles del grupo 2: ${cnt}`);
+  let ex = await exportNames();
+  expect((ex.arboles || [])[0] === 'arboles_malla' && (ex.arboles_2 || [])[0] === 'arboles_2_malla', `exportación por grupo: ${Object.keys(ex).filter((k) => k.startsWith('arb'))}`);
+  await page.click('#treeGroupTabs .gtab:nth-child(1)');
+  await idle();
+  gi = await ev(() => [window.__tsg.state.scene.treeGroupSel, document.getElementById('treeSide').value, window.__tsg.state.scene.treeScale, window.__tsg.preview.treeData.length]);
+  expect(gi[0] === 0 && gi[1] === 'both' && gi[2] === 1 && gi[3] === n0, `volver al grupo 1: ${gi}`);
+  // clic en 3D sobre un árbol del otro grupo: trae ese grupo
+  const pick = await ev(() => { const t = window.__tsg, pv = t.preview, m = pv.treeMeshesOther[0], p = m.geometry.getAttribute('position'); const x = p.getX(8), y = p.getY(8), z = p.getZ(8) - 3; pv.controls.target.set(x, y, z); pv.camera.position.set(x + 8, y - 14, z + 6); pv.controls.update(); pv.needsFrame = true; pv.renderer.render(pv.scene, pv.camera); const v = pv.camera.position.clone().set(x, y, z).project(pv.camera); const r = pv.renderer.domElement.getBoundingClientRect(); return [r.left + (v.x + 1) / 2 * r.width, r.top + (1 - v.y) / 2 * r.height]; });
+  await tool('pan');
+  await page.mouse.click(pick[0], pick[1]);
+  await idle();
+  expect((await ev(() => window.__tsg.state.scene.treeGroupSel)) === 1, 'clic en un árbol del otro grupo no trajo su grupo');
+  // sombra por grupo: según el sol aunque la general sea centrada (aparece el cuadro del sol)
+  await page.check('#shadows');
+  await page.check('#treeShadow');
+  await page.selectOption('#treeShadowMode', 'sun');
+  await idle();
+  await page.waitForTimeout(400); // (las sombras se rehacen con un pequeño retardo)
+  const sh = await ev(() => [window.__tsg.state.scene.shadowMode, window.__tsg.state.scene.treeShadowMode, document.getElementById('sunBox').hidden, (window.__tsg.preview.shadowInfo || {}).count || 0]);
+  expect(sh[0] === 'center' && sh[1] === 'sun' && !sh[2] && sh[3] > 3, `sombra del grupo: ${sh}`);
+  // quitar el grupo y deshacer
+  await page.click('#btnTreeGroupDel');
+  await idle();
+  expect((await ev(() => [window.__tsg.state.scene.treeGroups, document.getElementById('treeGroupEdit').hidden].join('|'))) === '|true', 'quitar grupo: queda uno solo');
+  await page.keyboard.press('Control+z');
+  await idle();
+  expect((await ev(() => (window.__tsg.state.scene.treeGroups || []).length)) === 2, 'deshacer no recuperó el grupo');
+  // textura propia por grupo: conos del grupo activo con textura, los del otro grupo siguen verdes
+  const mkPng = (col) => ev((col) => { const c = document.createElement('canvas'); c.width = c.height = 16; const g = c.getContext('2d'); g.fillStyle = col; g.fillRect(0, 0, 16, 16); return c.toDataURL('image/png').split(',')[1]; }, col).then((b) => Buffer.from(b, 'base64'));
+  const sel0 = await ev(() => window.__tsg.state.scene.treeGroupSel);
+  await page.setInputFiles('#fileTreeTex', { name: 'corteza.png', mimeType: 'image/png', buffer: await mkPng('#8b5a2b') });
+  await page.waitForFunction(() => !!window.__tsg.app.vegTexCanvas('tree'));
+  await idle();
+  let tx = await ev(() => { const pv = window.__tsg.preview; return [!!(pv.treeMesh && pv.treeMesh.material.map), pv.treeMeshesOther.map((m) => !!m.material.map).join(), !!pv.treeMesh.geometry.getAttribute('uv'), !document.getElementById('treeTexThumb').hidden]; });
+  expect(tx[0] && tx[1] === 'false' && tx[2] && tx[3], `textura de árboles por grupo (vista): ${tx}`);
+  const expMaps = () => ev(async () => { const t = window.__tsg, m = await import('/js/export-glb.js'); const { root } = await m.buildExportScene(t.state.layout, t.state.result, t.state.scene, { vegTexFor: (k, id) => t.app.vegTexCanvas(k, id), deco: { assetById: (id) => t.app.assetById(id), sets: [], paintFor: () => null } }); const out = {}; root.traverse((o) => { if (o.isMesh && /^(arboles|hierba)/.test(o.name)) out[o.name] = o.material.map ? o.material.map.image : null; }); return Object.fromEntries(Object.entries(out).map(([k, im]) => [k, im ? `${im.width}x${im.height}:${im.getContext ? im.getContext('2d').getImageData(0, 0, 1, 1).data.slice(0, 3).join('.') : '?'}` : null])); });
+  let mp = await expMaps();
+  const own = sel0 === 0 ? 'arboles_malla' : 'arboles_2_malla', other = sel0 === 0 ? 'arboles_2_malla' : 'arboles_malla';
+  expect(mp[own] && mp[own].endsWith('139.90.43') && mp[other] === null, `textura de árboles por grupo (exportación): ${JSON.stringify(mp)}`);
+  // hierba: sin «Single mesh»; un segundo grupo con su propia textura
+  expect((await ev(() => document.getElementById('grassSingle').checked)), 'la hierba empieza con «Single mesh»');
+  await page.check('#grass');
+  await idle();
+  await page.click('#btnGrassGroupNew');
+  await idle();
+  await page.setInputFiles('#fileGrassTex', { name: 'flores.png', mimeType: 'image/png', buffer: await mkPng('#ff00ff') });
+  await page.waitForFunction(() => window.__tsg.state.scene.grassGroupSel === 1 && !!window.__tsg.app.vegTexCanvas('grass'));
+  await idle();
+  mp = await expMaps();
+  expect(mp.hierba && !mp.hierba.endsWith('255.0.255') && mp.hierba_2 && mp.hierba_2.endsWith('255.0.255'), `textura de hierba por grupo: ${JSON.stringify(mp)}`);
+  const gm = await ev(() => { const pv = window.__tsg.preview; const ms = []; pv.extras.traverse((o) => { if (o.isMesh && o.userData.veg === 'grass') ms.push(o.material.map && o.material.map.image); }); return [ms.length, new Set(ms).size]; });
+  expect(gm[0] === 2 && gm[1] === 2, `vista: dos mallas de hierba con texturas distintas ${gm}`);
+  // el grupo 1 conserva la suya (por defecto) y las texturas vuelven al abrir el proyecto
+  await page.click('#grassGroupTabs .gtab:nth-child(1)');
+  await idle();
+  expect((await ev(() => [!window.__tsg.app.vegTexCanvas('grass'), document.getElementById('btnGrassTexRemove').disabled].join())) === 'true,true', 'el grupo 1 de hierba no debía tener textura propia');
+  const back = await ev(async (sel0) => { const t = window.__tsg, d = JSON.parse(JSON.stringify(await t.projectData())); await t.openProject(d); await t.idle(); const sc = t.state.scene; return [sc.grassGroups.length, !!t.app.vegTexCanvas('grass', sc.grassGroups[1].id), !!t.app.vegTexCanvas('grass', 'main'), !!t.app.vegTexCanvas('tree', sc.treeGroups[sel0].id)].join(); }, sel0);
+  expect(back === '2,true,false,true', `texturas por grupo al guardar y abrir: ${back}`);
+});
+
+test('hierba 0.86: single mesh por defecto y edición mata a mata; zonas pintadas en árboles y hierba; sets de decoración en pestañas', async () => {
+  await reset();
+  await page.click('#btnGenTerrain');
+  await idle();
+  await page.click('#btnGenTrees');
+  await idle();
+  await page.check('#grass');
+  await idle();
+  let s = await ev(() => { const $ = (id) => document.getElementById(id); const warn = (id) => { const n = $(id).closest('label').nextElementSibling; return !!n && n.classList.contains('single-warn') && n.offsetHeight > 0 && /rendimiento/.test(n.textContent); }; return [$('grassSingle').checked, warn('treeSingle'), warn('grassSingle'), !$('grassDensity').disabled, $('btnGrassReset').disabled]; });
+  expect(s.join() === 'true,true,true,true,true', `hierba con single mesh por defecto y aviso bajo las casillas: ${s}`);
+  let ex = await exportNames();
+  const n0 = await ev(() => window.__tsg.preview.grassData.length);
+  await page.uncheck('#grassSingle');
+  await idle();
+  s = await ev(() => { const t = window.__tsg, $ = (id) => document.getElementById(id); return [t.state.scene.grassBake.length, $('grassDensity').disabled, $('grassSide').disabled, $('grassScale').disabled, $('btnGrassReset').disabled, !!(t.preview.grassMesh && t.preview.grassMesh.userData.vegEdit), t.app.vegEditItems().filter((q) => q.kind === 'grass').length]; });
+  expect(s[0] === n0 && s[1] && s[2] && !s[3] && !s[4] && s[5] && s[6] === n0, `sin single mesh: lista fija y matas editables ${s}`);
+  // mover una mata (sigue apoyada en el suelo) y borrar otra
+  const mv = await ev(() => { const t = window.__tsg, v = { kind: 'grass', set: null, i: 4 }; t.app.selectVeg(v); const g0 = t.preview.grassData[4], x0 = g0.x; const P = t.app.moveVegLive(v, g0.x + 3, g0.y + 2); t.app.commitVegMove(v, P); const g1 = t.preview.grassData[4], G = t.preview.groundCache; return [g1.x - x0, Math.abs(g1.z + 0.03 - G.sample(g1.x, g1.y)), JSON.stringify(t.state.selVeg)]; });
+  expect(Math.abs(mv[0] - 3) < 0.01 && mv[1] < 1e-3 && mv[2].includes('grass'), `mover mata: ${mv}`);
+  await page.click('#btnGrassDel');
+  await idle();
+  expect((await ev(() => window.__tsg.state.scene.grassBake.length)) === n0 - 1, 'no se borró la mata');
+  ex = await exportNames();
+  expect((ex.hierba || []).length === n0 - 1 && ex.hierba[0] === 'hierba_0001', `exporta un objeto por mata: ${(ex.hierba || []).length}`);
+  await page.keyboard.press('Control+z');
+  await idle();
+  expect((await ev(() => window.__tsg.state.scene.grassBake.length)) === n0, 'deshacer no devolvió la mata');
+  await page.check('#grassSingle');
+  await idle();
+  s = await ev(() => [Array.isArray(window.__tsg.state.scene.grassBake), document.getElementById('grassDensity').disabled, document.getElementById('btnGrassReset').disabled]);
+  expect(s.join() === 'true,true,false', `editada a mano: queda fija con Restablecer ${s}`);
+  await page.click('#btnGrassReset');
+  await idle();
+  expect((await ev(() => window.__tsg.state.scene.grassBake)) === null, 'Restablecer no volvió a la distribución automática');
+  // árboles solo en zonas pintadas: se pinta en el mapa
+  await ev(() => document.querySelector('#treeMode button[data-m=painted]').click());
+  await idle();
+  s = await ev(() => { const t = window.__tsg, $ = (id) => document.getElementById(id); return [t.state.scene.treeMode, $('treePaintRow').hidden, $('treeSide').closest('.field').hidden, $('treeDensityLbl').textContent, t.preview.treeData.length, document.querySelector('#treeMode button.on').dataset.m]; });
+  expect(s[0] === 'painted' && !s[1] && s[2] && /1000 m²/.test(s[3]) && s[4] === 0 && s[5] === 'painted', `modo pintado: ${s}`);
+  await page.click('#btnTreePaint');
+  await idle();
+  const spot = await ev(() => { const t = window.__tsg, L = t.state.layout, r = L.routes[0], i = Math.floor(r.n * 0.25); let cx = 0, cy = 0; for (let k = 0; k < r.n; k++) { cx += r.x[k] / r.n; cy += r.y[k] / r.n; } const dx = cx - r.x[i], dy = cy - r.y[i], l = Math.hypot(dx, dy); return { x: r.x[i] + (dx / l) * 45, y: r.y[i] + (dy / l) * 45 }; }); // hacia adentro del circuito (a la vista en el mapa)
+  const [px, py] = await mapXY(spot.x, spot.y);
+  await drag(px, py, px + 25, py + 10, 6);
+  await idle();
+  await page.waitForTimeout(200);
+  await idle();
+  s = await ev((spot) => { const t = window.__tsg, P = t.state.scene.treePaint, tr = t.preview.treeData, far = tr.filter((q) => Math.hypot(q.x - spot.x, q.y - spot.y) > 80).length; return [P.length, tr.length, far, document.getElementById('btnTreePaint').textContent, t.state.tool]; }, spot);
+  expect(s[0] > 0 && s[1] > 0 && s[2] === 0 && s[4] === 'itemPaint' && /Terminar/.test(s[3]), `árboles en la zona pintada: ${s}`);
+  await page.click('#btnTreePaint');
+  await ev(() => document.querySelector('#treeMode button[data-m=road]').click());
+  await idle();
+  expect((await ev(() => [window.__tsg.state.tool, window.__tsg.preview.treeData.length > 10].join())) === 'pan,true', 'vuelta a «Junto a la pista»');
+  // hierba solo en zonas pintadas (zonas propias de la hierba)
+  await ev((spot) => { const t = window.__tsg, L = t.state.layout, [lx, ly] = L.toLayout(spot.x, spot.y); t.state.scene.grassPaint = [{ x: lx, y: ly, r: 15 / L.scale, e: false }]; document.querySelector('#grassMode button[data-m=painted]').click(); }, spot);
+  await idle();
+  s = await ev((spot) => { const t = window.__tsg, g = t.preview.grassData; return [g.length, g.filter((q) => Math.hypot(q.x - spot.x, q.y - spot.y) > 15.5).length, t.state.scene.treePaint.length > 0]; }, spot);
+  expect(s[0] > 5 && s[1] === 0 && s[2], `hierba en su zona pintada: ${s}`);
+  // sets de decoración en pestañas, con «Junto a la pista» / «Solo en zonas pintadas» como botones
+  await ev(() => document.getElementById('btnDecoNew').click());
+  await idle();
+  await ev(() => document.getElementById('btnDecoNew').click());
+  await idle();
+  s = await ev(() => { const t = window.__tsg; return [document.querySelectorAll('#decoTabs .gtab').length, document.querySelectorAll('#decoList .deco-card').length, document.querySelector('#decoList .deco-card').dataset.id === t.state.decoSets[1].id, document.querySelector('#decoTabs .gtab.on').textContent, !!document.querySelector('#decoList .deco-card select.dm'), !!document.querySelector('#decoList .deco-card .single-warn')]; });
+  expect(s[0] === 2 && s[1] === 1 && s[2] && s[3] === 'set_2' && !s[4] && s[5], `pestañas de sets: ${s}`);
+  await page.click('#decoTabs .gtab:nth-child(1)');
+  await idle();
+  s = await ev(() => [document.querySelector('#decoList .deco-card').dataset.id === window.__tsg.state.decoSets[0].id, document.querySelector('#decoTabs .gtab.on').textContent]);
+  expect(s[0] && s[1] === 'set_1', `pestaña 1: ${s}`);
+  await page.click('#decoList .deco-card .dmode button[data-m=painted]');
+  await idle();
+  s = await ev(() => [window.__tsg.state.decoSets[0].mode, document.querySelector('#decoList .deco-card .dmode button.on').dataset.m, !document.querySelector('#decoList .deco-card .dpaint').hidden]);
+  expect(s.join() === 'painted,painted,true', `set en zonas pintadas: ${s}`);
+  ex = await exportNames();
+  expect((ex.set_2 || []).length === 1 && (ex.set_1 || []).length === 0, `exportación de los sets: ${Object.keys(ex).filter((k) => k.startsWith('set'))}`);
+});
+
+test('nodos 0.87 (desde Elementos de pista, sección en Juego, exportación) y decoración sobre la pista / caminos de tierra', async () => {
+  await reset();
+  // se agregan desde «Elementos de pista ▾»; la sección está en «Juego»
+  await page.click('#btnItemsMenu');
+  await page.click('#btnTbNodes');
+  await idle();
+  let s = await ev(() => { const t = window.__tsg, secs = [...document.querySelectorAll('#sidebar > section.panel[data-panel]')]; let g = null, grp = null; for (const q of secs) { if (q.dataset.group) g = q.dataset.group; if (q.dataset.panel === 'nodes') grp = g; } return [t.state.scene.nodes, grp, document.querySelector('section.panel[data-panel="nodes"]').classList.contains('focus-ring'), (t.preview.nodeData || []).length, (t.preview.nodeGroup ? t.preview.nodeGroup.children.length : -1)]; });
+  expect(s[0] === true && s[1] === 'Juego' && s[2] && s[3] === 10 && s[4] === 10, `nodos activados: ${s}`);
+  await ev(() => { const el = document.getElementById('nodeCountNum'); el.value = '25'; el.dispatchEvent(new Event('change', { bubbles: true })); });
+  await idle();
+  let ex = await exportNames();
+  const nodes = ex.nodos || [];
+  expect(nodes.length === 25 && nodes[0] === 'nodo_0' && nodes[24] === 'nodo_24', `exportación de los nodos: ${nodes.length} (${nodes[0]} … ${nodes[nodes.length - 1]})`);
+  const nm = await ev(async () => { const t = window.__tsg, m = await import('/js/export-glb.js'); const { root } = await m.buildExportScene(t.state.layout, t.state.result, t.state.scene, { deco: { assetById: (id) => t.app.assetById(id), sets: [], paintFor: () => null } }); const g = root.getObjectByName('nodos'); const a = g.children[0], b = g.children[24]; return [a.material.opacity, a.material.name, a.position.distanceTo(b.position) < 1e-4, a.userData.node, b.userData.node, a.geometry.parameters.width]; });
+  expect(nm[0] === 0 && nm[1] === 'nodo' && nm[2] && nm[3] === 0 && nm[4] === 24 && nm[5] === 1, `nodos invisibles, el primero y el último coinciden en el circuito cerrado: ${nm}`);
+  expect(/25 nodos/.test(await ev(() => document.getElementById('nodeInfo').textContent)), 'info de nodos');
+  // decoración: «Automático» / «Pintado»; en Automático, la lista «Distribución»
+  await ev(() => { const sc = window.__tsg.state.scene; sc.dirtSide = 'both'; sc.dirtWidth = 4; window.__tsg.preview.update(false); });
+  await idle();
+  await ev(() => document.getElementById('btnDecoNew').click());
+  await idle();
+  const c = '#decoList .deco-card';
+  s = await ev((c) => [...document.querySelectorAll(`${c} .dmode button`)].map((b) => b.textContent).join('|') + ' ' + !document.querySelector(`${c} .dplaceBox`).hidden, c);
+  expect(s === 'Automático|Pintado true', `interruptor y distribución: ${s}`);
+  const band = () => ev(() => { const t = window.__tsg, set = t.state.decoSets[0], items = t.preview.decoItemsBySet[set.id] || []; return import('/js/scene.js').then((m) => { const b = items.map((it) => { const R = m.roadSurfaceAt(t.state.layout, t.state.result, t.state.scene, it.x, it.y); return R ? R.band : 'off'; }); return [items.length, b.filter((x) => x === 'track').length, b.filter((x) => x === 'dirt').length, b.filter((x) => x === 'off' || x == null).length]; }); });
+  for (const [place, want] of [['track', [1, 0, 0]], ['dirt', [0, 1, 0]], ['trackdirt', [1, 1, 0]]]) {
+    await page.selectOption(`${c} select.dplace`, place);
+    await idle();
+    const b = await band();
+    const ok = b[0] > 10 && (want[0] ? b[1] > 0 : b[1] === 0) && (want[1] ? b[2] > 0 : b[2] === 0) && b[3] === 0;
+    expect(ok, `distribución ${place}: ${b}`);
+  }
+  expect((await ev((c) => document.querySelector(`${c} .droad`).hidden, c)), 'sobre la pista no van distancia ni dispersión');
+  await page.click(`${c} .dmode button[data-m=painted]`);
+  await idle();
+  expect((await ev((c) => document.querySelector(`${c} .dplaceBox`).hidden, c)), 'en Pintado no se muestra la distribución');
+  expect((await ev(() => [...document.querySelectorAll('#treeMode button, #grassMode button')].map((b) => b.textContent).join('|'))) === 'Automático|Pintado|Automático|Pintado', 'árboles y hierba: Automático / Pintado');
+});
+
+test('transición 0.87: casilla en la tarjeta del tramo, inicial y final (igual a la inicial, flips) y exportación', async () => {
+  await reset();
+  await makeTramo('track', [5, 6, 7, 8, 9]);
+  const card = '#bridgeList .item';
+  let s = await ev((c) => { const d = document.querySelector(c); return [d.querySelector('.btrans').checked, d.querySelector('.btransBox').hidden]; }, card);
+  expect(s.join() === 'false,true', `transición apagada por defecto: ${s}`);
+  await page.click(`${card} .btrans`);
+  await idle();
+  s = await ev((c) => { const d = document.querySelector(c), f = (k) => d.querySelector(`.btf[data-k="${k}"]`).checked; return [d.querySelector('.btransBox').hidden, f('transInFX'), f('transInFY'), f('transOutFX'), f('transOutFY'), d.querySelector('.btexRm[data-kind="transOut"]').textContent, d.querySelector('.btexRm[data-kind="transOut"]').disabled, d.querySelector('img.bthumb[data-kind="transOut"]').classList.contains('inherited')]; }, card);
+  expect(s.join() === 'false,false,false,false,true,Igual a la inicial,true,true', `inicial y final: ${s}`);
+  let ex = await exportNames();
+  const tr = (ex.pista || []).filter((n) => n.startsWith('transicion_'));
+  expect(tr.join() === 'transicion_01_inicial,transicion_01_final', `exportación: ${tr}`);
+  const n = await ev(() => { const g = window.__tsg.preview.trackGroup; let k = 0; g.traverse((o) => { if (o.userData.texOverlay) k = o.geometry.groups.length; }); return k; });
+  expect(n >= 3, `vista: grupos de material de la pista ${n}`);
+  // textura propia de la inicial: la final (sin propia) la usa
+  const png = Buffer.from(await ev(() => { const c = document.createElement('canvas'); c.width = c.height = 8; const g = c.getContext('2d'); g.fillStyle = '#00ff00'; g.fillRect(0, 0, 8, 8); return c.toDataURL('image/png').split(',')[1]; }), 'base64');
+  const [fc] = await Promise.all([page.waitForEvent('filechooser'), page.click(`${card} .btex[data-kind="transIn"]`)]);
+  await fc.setFiles({ name: 'trans.png', mimeType: 'image/png', buffer: png });
+  await page.waitForFunction(() => !!window.__tsg.app.bridgeOwnTex(0, 'transIn'));
+  await idle();
+  s = await ev(() => { const a = window.__tsg.app; return [a.transTexCanvas(0, 'in') === a.bridgeOwnTex(0, 'transIn'), a.transTexCanvas(0, 'out') === a.bridgeOwnTex(0, 'transIn')]; });
+  expect(s.join() === 'true,true', `la final usa la inicial: ${s}`);
+  await page.click(`${card} .btf[data-k="transOutFY"]`);
+  await idle();
+  expect((await ev(() => window.__tsg.state.project.main.bridges[0].transOutFY)) === false, 'flip Y de la final');
+  const back = await ev(async () => { const t = window.__tsg, d = JSON.parse(JSON.stringify(await t.projectData())); await t.openProject(d); await t.idle(); const b = t.state.project.main.bridges[0]; return [b.trans, b.transOutFY, !!t.app.bridgeOwnTex(0, 'transIn')].join(); });
+  expect(back === 'true,false,true', `guardar y abrir: ${back}`);
+});
+
+test('0.88: casilla Nodos en 3D, Colisiones gris sin colisión, planos acostados, «Agua», decoración de lagos y sobre el agua, paredes por río', async () => {
+  await reset();
+  let s = await ev(() => { const $ = (id) => document.getElementById(id); return [!!$('showNodes'), $('showCollision').disabled, document.querySelector('[data-tool=river]').textContent.trim(), !!$('riverArtBtn'), !!$('riverWallTileX')]; });
+  expect(s[0] && s[1] === true && s[2] === 'Agua' && !s[3] && !s[4], `barra 3D y paneles: ${s}`);
+  await ev(() => { const sc = window.__tsg.state.scene; sc.dirtSide = 'both'; sc.collision = true; window.__tsg.preview.update(false); });
+  await idle();
+  expect((await ev(() => document.getElementById('showCollision').disabled)) === false, 'con colisión, la casilla se activa');
+  // nodos: su propia casilla
+  await page.click('#btnItemsMenu'); await page.click('#btnTbNodes'); await idle();
+  await page.uncheck('#showNodes'); await idle();
+  s = await ev(() => { const t = window.__tsg; return [t.preview.nodeGroup.visible, t.preview.nodeGroup.children.length, t.state.scene.showTriggers !== false]; });
+  expect(s[0] === false && s[1] === 10 && s[2], `ocultar nodos no toca los triggers: ${s}`);
+  await page.check('#showNodes'); await idle();
+  expect((await ev(() => window.__tsg.preview.nodeGroup.visible)), 'mostrar nodos');
+  // planos acostados en la forma de los sets
+  await page.click('#btnGenTerrain'); await idle();
+  await ev(() => document.getElementById('btnDecoNew').click()); await idle();
+  const opts = await ev(() => [...document.querySelectorAll('#decoList .deco-card .dshape option')].map((o) => o.value + ':' + o.textContent).join('|'));
+  expect(opts === 'cube:Cubos|plane:Planos de pie|flat:Planos acostados', `formas: ${opts}`);
+  await page.selectOption('#decoList .deco-card .dshape', 'flat'); await idle();
+  s = await ev(() => { const t = window.__tsg, set = t.state.decoSets[0], it = t.preview.decoItemsBySet[set.id]; return [it.length, it.every((q) => q.asset === 'flat:' + set.color), it.some((q) => q.up[2] < 0.9999)]; });
+  expect(s[0] > 5 && s[1] && s[2], `planos acostados posados: ${s}`);
+  // lago con decoración propia (automática, a distancia de la orilla)
+  await ev(() => { const t = window.__tsg, L = t.state.layout, r = L.routes[0]; let cx = 0, cy = 0; for (let i = 0; i < r.n; i++) { cx += r.x[i] / r.n; cy += r.y[i] / r.n; } const [lx, ly] = L.toLayout(cx, cy); t.state.rivers = [{ id: 1, kind: 'river', mode: 'carved', depth: 3, walls: 'nat', wallSubdiv: 1, waterType: 'lake', strokes: [{ x: lx, y: ly, r: 28 / L.scale, e: false }], uvOwn: true, tileX: 4, tileY: 4, uvFit: 0, uvSnap: false }]; t.app.riversChanged(); });
+  await idle();
+  const card = '#riverList .river-card';
+  s = await ev((c) => { const d = document.querySelector(c); return [!!d.querySelector('.ruvOwn'), !d.querySelector('.ruvBox').hidden, d.querySelector('.rtexRm').textContent, !!d.querySelector('.rdOn'), d.querySelector('.rdBox').hidden]; }, card);
+  expect(s.join() === 'false,true,Por defecto,true,true', `tarjeta del lago: paredes propias y decoración ${s}`);
+  await page.check(`${card} .rdOn`); await idle();
+  s = await ev(() => { const t = window.__tsg, it = (t.preview.decoItemsBySet || {}).rdeco1 || []; const W = t.preview.groundCache.waterAt; return [it.length, it.every((q) => { const w = W(q.x, q.y); return w && Math.abs(q.z - w.z - 0.06) < 1e-6; }), it[0] && it[0].asset]; });
+  expect(s[0] > 5 && s[1] && /^flat:/.test(s[2]), `decoración del lago sobre el agua: ${s}`);
+  let ex = await exportNames();
+  expect((ex.lago_01_deco || []).length === 1 && ex.lago_01_deco[0] === 'lago_01_deco_malla', `exportación de la decoración del lago: ${Object.keys(ex).filter((k) => /deco/.test(k))}`);
+  await page.click(`${card} .rdMode button[data-m=painted]`); await idle();
+  s = await ev((c) => { const d = document.querySelector(c); return [d.querySelector('.rdAuto').hidden, d.querySelector('.rdPaint').hidden, (window.__tsg.preview.decoItemsBySet.rdeco1 || []).length]; }, card);
+  expect(s.join() === 'true,false,0', `lago en Pintado: ${s}`);
+  // set pintado sobre el agua: casilla «También sobre el agua»
+  await page.click('#decoList .deco-card .dmode button[data-m=painted]'); await idle();
+  expect((await ev(() => [!document.querySelector('#decoList .deco-card .dwater').hidden, document.querySelector('#decoList .deco-card .dwaterCb').checked].join())) === 'true,true', 'sets pintados: también sobre el agua');
+});
+
+test('0.89: ríos, lagos y cascadas en pestañas; sin agua, lecho ni paredes generales (todo en cada tarjeta)', async () => {
+  await reset();
+  await page.click('#btnGenTerrain'); await idle();
+  let s = await ev(() => ['riverWaterU', 'waterTexRiverBtn', 'riverBedBtn', 'lakeWaterL2'].map((id) => !!document.getElementById(id)).join());
+  expect(s === 'false,false,false,false', `sin controles generales: ${s}`);
+  await ev(() => { const t = window.__tsg, L = t.state.layout, r = L.routes[0]; let cx = 0, cy = 0; for (let i = 0; i < r.n; i++) { cx += r.x[i] / r.n; cy += r.y[i] / r.n; } const P = (x, y, rr) => { const [a, b] = L.toLayout(x, y); return { x: a, y: b, r: rr / L.scale, e: false }; }; t.state.rivers = [1, 2, 3].map((id) => ({ id, kind: 'river', mode: 'carved', depth: 2, walls: 'nat', wallSubdiv: 1, strokes: [P(cx - 60 + id * 30, cy, 8)] })); t.app.riversChanged(); });
+  await idle();
+  s = await ev(() => [document.querySelectorAll('#riverTabs .gtab').length, [...document.querySelectorAll('#riverList .river-card')].filter((d) => !d.hidden).length, document.querySelector('#riverTabs .gtab.on').dataset.id]);
+  expect(s[0] === 3 && s[1] === 1 && s[2] === '1', `pestañas: ${s}`);
+  await page.click('#riverTabs .gtab:nth-child(3)'); await idle();
+  s = await ev(() => [document.querySelector('#riverTabs .gtab.on').dataset.id, [...document.querySelectorAll('#riverList .river-card')].find((d) => !d.hidden).dataset.id, window.__tsg.state.selRiver]);
+  expect(s.join() === '3,3,3', `pestaña 3: ${s}`);
+  s = await ev(() => { const d = [...document.querySelectorAll('#riverList .river-card')].find((q) => !q.hidden); return [!!d.querySelector('.rwuvOwn'), !d.querySelector('.rwuvBox').hidden, [...d.querySelectorAll('.rw2 option')].map((o) => o.textContent).join('/'), !!d.querySelector('.rtex[data-kind="bed"]')]; });
+  expect(s.join() === 'false,true,Sí/No,true', `agua y lecho en la tarjeta: ${s}`);
+});
+
+test('0.90: lagos y cascadas con su nombre en las pestañas; decoración del lago con deslizadores; coin stripes con monedas que giran', async () => {
+  await reset();
+  await page.click('#btnGenTerrain'); await idle();
+  await ev(() => { const t = window.__tsg, L = t.state.layout, r = L.routes[0]; let cx = 0, cy = 0; for (let i = 0; i < r.n; i++) { cx += r.x[i] / r.n; cy += r.y[i] / r.n; } const P = (x, y, rr) => { const [a, b] = L.toLayout(x, y); return { x: a, y: b, r: rr / L.scale, e: false }; }; t.state.rivers = [{ id: 1, kind: 'river', mode: 'carved', depth: 2, walls: 'nat', wallSubdiv: 1, waterType: 'river', strokes: [P(cx - 40, cy, 8)] }, { id: 2, kind: 'river', mode: 'carved', depth: 3, walls: 'nat', wallSubdiv: 1, waterType: 'lake', strokes: [P(cx + 20, cy, 25)] }, { id: 3, kind: 'river', mode: 'carved', depth: 3, walls: 'nat', wallSubdiv: 1, waterType: 'lake', strokes: [P(cx + 20, cy + 60, 20)] }]; t.app.riversChanged(); });
+  await idle();
+  let s = await ev(() => [...document.querySelectorAll('#riverTabs .gtab')].map((b) => b.textContent.trim().split(' ').pop()).join());
+  expect(s === 'rio_01,lago_01,lago_02', `nombres en las pestañas: ${s}`);
+  // decoración del lago: deslizador + número
+  await page.click('#riverTabs .gtab:nth-child(2)'); await idle();
+  const card = '#riverList .river-card[data-id="2"]';
+  await page.check(`${card} .rdOn`); await idle();
+  s = await ev((c) => { const d = document.querySelector(c); return ['distMin', 'distMax', 'density', 'size', 'spacing', 'sizeVar', 'max'].map((k) => d.querySelectorAll(`.rdN[data-k="${k}"]`).length === 2 && !!d.querySelector(`input[type=range].rdN[data-k="${k}"]`)).every(Boolean); }, card);
+  expect(s, 'deslizadores en la decoración del lago');
+  const n0 = await ev(() => ((window.__tsg.preview.decoItemsBySet || {}).rdeco2 || []).length);
+  await ev((c) => { const r = document.querySelector(`${c} input[type=range].rdN[data-k="density"]`); r.value = 120; r.dispatchEvent(new Event('input', { bubbles: true })); r.dispatchEvent(new Event('change', { bubbles: true })); }, card);
+  await idle(); await page.waitForTimeout(100);
+  s = await ev((c) => [window.__tsg.state.rivers[1].deco.density, document.querySelector(`${c} input[type=number].rdN[data-k="density"]`).value, ((window.__tsg.preview.decoItemsBySet || {}).rdeco2 || []).length], card);
+  expect(s[0] === 120 && s[1] === '120' && s[2] > n0, `densidad con el deslizador: ${s} (antes ${n0})`);
+  // coin stripes
+  await page.click('#btnItemsMenu'); await page.click('#btnTbCoin'); await idle();
+  s = await ev(() => { const t = window.__tsg, g = t.state.items.coin[0], inst = t.app.itemInstances().find((q) => q.type === 'coin'); return [g && g.gid, inst && inst.items.length, inst && inst.items[0].coins.length, t.preview.coinSpins.length, !!document.querySelector('.igroup[data-type="coin"] input[data-f="coinH"][type=range]')]; });
+  expect(s[0] === 'A' && s[1] > 0 && s[2] === 6 && s[3] === s[1] * 6 && s[4], `coin stripes: ${s}`);
+  const setF = (f, v) => ev(([f, v]) => { const el = document.querySelector(`.igroup[data-type="coin"] input[type=range][data-f="${f}"]`); el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }, [f, v]);
+  await setF('coinN', 3); await setF('coinH', 2); await setF('coinSize', 1.5); await idle();
+  s = await ev(() => { const t = window.__tsg, it = t.app.itemInstances().find((q) => q.type === 'coin').items[0]; return [it.coins.length, it.coinSize, Math.hypot(...it.coins[1].p) < 2.5 && it.coins[1].p[2] > 1.5, t.preview.coinMeshes[0].geometry.parameters.radiusTop]; });
+  expect(s[0] === 3 && s[1] === 1.5 && s[2] && s[3] === 0.75, `monedas: cantidad, tamaño y altura ${s}`);
+  // exportación: monedas hijas de su stripe
+  s = await ev(async () => { const t = window.__tsg, m = await import('/js/export-glb.js'); const { root } = await m.buildExportScene(t.state.layout, t.state.result, t.state.scene, {}, null, t.app.hillsWorld(), t.app.itemInstances()); const st = root.getObjectByName('coinstripeA-1'); return [st && st.parent.name, st && st.children.map((c) => c.name).join('|'), st && st.children[0].material.name, st && st.material.name]; });
+  expect(s[0] === 'coinstripeA' && s[1] === 'coinstripeA-1_moneda_1|coinstripeA-1_moneda_2|coinstripeA-1_moneda_3' && s[2] === 'moneda' && s[3] === 'coinstripe', `exportación: ${s}`);
+  // giran en la cámara de juego
+  await page.click('#btnGame');
+  await page.waitForFunction(() => window.__tsg.preview.game.active);
+  const a0 = await ev(() => window.__tsg.preview.coinSpins[0].rotation.z);
+  await page.waitForTimeout(300);
+  const a1 = await ev(() => window.__tsg.preview.coinSpins[0].rotation.z);
+  expect(Math.abs(a1 - a0) > 0.05, `monedas girando: ${a0} → ${a1}`);
+  await page.keyboard.press('Escape'); await idle();
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+/** Corre las pruebas elegidas en un navegador propio (un proceso). Devuelve {pass, fails, total}. */
+async function runTests(run, port) {
+  const browser = await chromium.launch({ args: ['--use-gl=swiftshader', '--enable-webgl', '--ignore-gpu-blocklist'] });
+  const ctx = await browser.newContext({ viewport: { width: 1500, height: 950 }, acceptDownloads: true });
+  page = await ctx.newPage();
+  page.on('pageerror', (e) => errs.push(String(e)));
+  page.on('console', (m) => { if (m.type() === 'error') errs.push(m.text()); });
+  page.on('dialog', (d) => { dialogs.push(d.message()); d.accept(); });
+  URL = `http://localhost:${port}/`;
+  await freshPage();
+  let pass = 0;
+  const fails = [];
+  for (const t of run) {
+    const e0 = errs.length, ts = Date.now();
+    try {
+      await t.fn();
+      if (process.env.TSG_MISSING) { try { const m = await ev(() => window.__tsg.i18n.missingTexts()); require('fs').appendFileSync(process.env.TSG_MISSING, m.join('\n') + '\n'); } catch { /* sin página */ } }
+      if (errs.length > e0) throw new Error('errores en la página: ' + errs.slice(e0).join(' | '));
+      pass++;
+      console.log(`  ✓ ${t.name} (${((Date.now() - ts) / 1000).toFixed(1)} s)`);
+    } catch (err) {
+      const shot = path.join(os.tmpdir(), `tsg-ui-${process.pid}-${fails.length + 1}.png`);
+      try { await page.screenshot({ path: shot }); } catch { /* sin captura */ }
+      fails.push(t.name);
+      console.log(`  ✗ ${t.name}\n      ${err.message.split('\n')[0]}\n      captura: ${shot}`);
+      try { await page.keyboard.press('Escape'); } catch { /* seguir */ }
+    }
+  }
+  await browser.close();
+  return { pass, fails };
+}
+
+function startServer() {
+  const port = 5190 + Math.floor(Math.random() * 60);
+  const server = spawn(process.execPath, [path.join(ROOT, 'server.js')], { env: { ...process.env, PORT: String(port), NO_OPEN: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  return new Promise((res, rej) => {
+    server.stdout.on('data', (d) => { if (/corriendo/.test(String(d))) res({ server, port }); });
+    server.on('exit', (c) => rej(new Error('el servidor terminó: ' + c)));
+    setTimeout(() => rej(new Error('el servidor no respondió')), 8000);
+  });
+}
+
+async function main() {
+  const t0 = Date.now();
+  const selected = tests.filter((t) => !filters.length || filters.some((f) => t.name.toLowerCase().includes(f)));
+  if (SHARD) { // proceso hijo: su parte de las pruebas, con el servidor del padre
+    const [i, n] = SHARD;
+    const { fails } = await runTests(selected.filter((_, k) => k % n === i), parseInt(process.env.TSG_PORT, 10));
+    process.exit(fails.length ? 1 : 0);
+  }
+  const { server, port } = await startServer();
+  let pass = 0, failed = 0;
+  const n = Math.min(jobs, selected.length);
+  if (n <= 1) {
+    const r = await runTests(selected, port);
+    pass = r.pass; failed = r.fails.length;
+  } else {
+    // n procesos, cada uno con su navegador; las pruebas se reparten en orden alterno (las lentas quedan parejas)
+    const codes = await Promise.all(Array.from({ length: n }, (_, i) => new Promise((res) => {
+      const ch = spawn(process.execPath, [__filename, ...argv], { env: { ...process.env, TSG_SHARD: `${i}/${n}`, TSG_PORT: String(port) }, stdio: ['ignore', 'pipe', 'inherit'] });
+      ch.stdout.on('data', (d) => { const txt = String(d); process.stdout.write(txt); pass += (txt.match(/^ {2}✓/gm) || []).length; failed += (txt.match(/^ {2}✗/gm) || []).length; });
+      ch.on('exit', res);
+    })));
+    if (codes.some((c) => c !== 0 && c !== 1)) failed = Math.max(failed, 1);
+  }
+  server.kill();
+  console.log(`\n${pass} de ${selected.length} pruebas de interfaz correctas${failed ? ` · ${failed} con fallas` : ''} · ${n} proceso(s) · ${((Date.now() - t0) / 1000).toFixed(0)} s`);
+  process.exit(failed || pass !== selected.length ? 1 : 0);
+}
+main().catch((e) => { console.error(e); process.exit(2); });

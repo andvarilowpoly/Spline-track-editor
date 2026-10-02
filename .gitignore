@@ -1,0 +1,7 @@
+node_modules/
+scratch/
+test/shots/
+.vercel/
+dist/
+*.log
+.DS_Store

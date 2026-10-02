@@ -1,0 +1,2405 @@
+// Vista 3D liviana (three.js) solo para revisar; la geometría final se hace en Blender / 3ds Max.
+import * as THREE from 'three';
+import { OrbitControls } from '../vendor/OrbitControls.js';
+import { TransformControls } from '../vendor/TransformControls.js';
+import { edgeSamples } from './export.js';
+import { buildEdgeMeshes } from './edges.js';
+import { buildCollisionMeshes } from './collision.js';
+import { instancedGroup, instanceMatrix } from './assets.js';
+import { decoSetItems, treeModelItems, treeModelItem, grassModelItems } from './deco.js';
+import { buildShadows, shadowCasters, sunVector, shadowUsesSun } from './shadows.js';
+import { buildSigns } from './signs.js';
+import { buildTrackMesh, trackRows, trackCols, coveredRanges, terrainTint, buildTerrain, buildTrees, buildTreeGroups, buildGrassGroups, vegGroups, buildNodes, decoPlace, waterSurfaceSampler, moveGrass, grassTuftVerts, buildHills, buildStartGate, buildGrass, makeGround, bridgePillars, suspPillars, pillarBlocked, moveTree, treeConeVerts, vegPlace, buildTriggers } from './scene.js';
+import { buildRivers } from './rivers.js';
+import { pillarGeometry, torchGeometry } from './tunnels.js';
+import { applyRefLook } from './refmodel.js';
+import { makeBannerCanvas, makeCheckerCanvas, makeGrassCanvas, makePadCanvas, makeGlowCanvas, makeAsphaltCanvas, makeBridgeCanvas } from './gatetex.js';
+
+const BRUSH_SEGS = 72; // segmentos del aro del pincel
+
+export class Preview3D {
+  constructor(container, app) {
+    this.app = app;
+    this.el = container;
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    this.renderer.setPixelRatio(window.devicePixelRatio || 1);
+    this.renderer.setClearColor(0x0e1117);
+    container.appendChild(this.renderer.domElement);
+    this.scene = new THREE.Scene();
+    this.scene.fog = new THREE.Fog(0x0e1117, 1500, 5000);
+    this.camera = new THREE.PerspectiveCamera(45, 1, 1, 20000);
+    this.camera.up.set(0, 0, 1);
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping = true;
+    this.scene.add(new THREE.HemisphereLight(0xdde6ff, 0x202020, 1.6));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+    sun.position.set(400, -300, 800);
+    this.scene.add(sun);
+    this.sunLight = sun; // sigue al sol de los planos de sombra si se pide (updateSunLight)
+    this.group = new THREE.Group();
+    this.scene.add(this.group);
+    // grupos en metros reales con la exageración Z aplicada como escala
+    this.trackGroup = new THREE.Group();
+    this.extras = new THREE.Group();
+    this.pillars = new THREE.Group();
+    this.itemsGroup = new THREE.Group(); // charcos, turbo pads, nitro strips
+    this.triggerGroup = new THREE.Group(); // triggers (semitransparentes en la vista; invisibles al exportar)
+    this.scene.add(this.trackGroup, this.extras, this.pillars, this.itemsGroup, this.triggerGroup);
+    this.texCache = new Map();
+    this.terrainData = null;
+    this.extrasTimer = null;
+    this.grid = null;
+    this.marker = new THREE.Mesh(new THREE.SphereGeometry(3, 16, 12), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+    this.marker.visible = false;
+    this.scene.add(this.marker);
+    this.zExag = 1.5;
+    this.needsFrame = true;
+    // --- edición de puntos en 3D ---
+    this.handleGroup = new THREE.Group();
+    this.scene.add(this.handleGroup);
+    this.segGroup = new THREE.Group(); // segmentos seleccionados (nivel Segmento)
+    this.scene.add(this.segGroup);
+    this.proxy = new THREE.Object3D();
+    this.scene.add(this.proxy);
+    this.tc = new TransformControls(this.camera, this.renderer.domElement);
+    this.tc.setSpace('world');
+    this.tc.setSize(0.9);
+    this.scene.add(this.tc.getHelper());
+    this.gizmoMode = 'free';
+    this.dragSel = null;
+    this.tcUsed = false;
+    this.tc.addEventListener('change', () => (this.needsFrame = true));
+    this.tc.addEventListener('dragging-changed', (e) => {
+      this.controls.enabled = !e.value;
+      if (e.value) this.onDragStart(); else this.onDragEnd();
+    });
+    this.tc.addEventListener('objectChange', () => this.onGizmoMove());
+    // gizmo de altura del cerro seleccionado (solo eje Z)
+    this.hillProxy = new THREE.Object3D();
+    this.scene.add(this.hillProxy);
+    this.hillTc = new TransformControls(this.camera, this.renderer.domElement);
+    this.hillTc.setSpace('world');
+    this.hillTc.setSize(1.2);
+    this.hillTc.showX = false; this.hillTc.showY = false;
+    this.scene.add(this.hillTc.getHelper());
+    this.hillTc.enabled = false;
+    this.hillTc.addEventListener('change', () => (this.needsFrame = true));
+    this.hillTc.addEventListener('dragging-changed', (e) => {
+      this.controls.enabled = !e.value;
+      const hd = this.hillDrag;
+      if (e.value && hd) { hd.z0 = this.hillProxy.position.z; hd.active = true; }
+      if (!e.value && hd && hd.active) {
+        hd.active = false;
+        if (Math.abs(hd.newH - hd.h0) > 0.05 && this.app.setHillHeight) this.app.setHillHeight(hd.id, hd.newH);
+      }
+    });
+    this.hillTc.addEventListener('objectChange', () => {
+      const hd = this.hillDrag;
+      if (!hd || !hd.active) return;
+      hd.newH = Math.max(1, Math.min(400, hd.h0 + (this.hillProxy.position.z - hd.z0)));
+      // vista previa: la malla del cerro se estira en altura desde su base (al soltar se rehace de verdad)
+      const k = hd.newH / hd.h0;
+      for (const m of hd.meshes) { m.scale.z = k; m.position.z = hd.zb * (1 - k); }
+      if (this.app.onHillHeightPreview) this.app.onHillHeightPreview(hd.id, hd.newH);
+      this.needsFrame = true;
+    });
+    // puntos de control del cerro seleccionado: esferas y un gizmo (XY mueve el punto, Z sube o hunde esa zona)
+    this.hillCtrlGroup = new THREE.Group();
+    this.scene.add(this.hillCtrlGroup);
+    this.hctrlProxy = new THREE.Object3D();
+    this.scene.add(this.hctrlProxy);
+    this.hctrlTc = new TransformControls(this.camera, this.renderer.domElement);
+    this.hctrlTc.setSpace('world');
+    this.hctrlTc.setSize(0.9);
+    this.scene.add(this.hctrlTc.getHelper());
+    this.hctrlTc.enabled = false;
+    this.hctrlTc.addEventListener('change', () => (this.needsFrame = true));
+    this.hctrlTc.addEventListener('dragging-changed', (e) => {
+      this.controls.enabled = !e.value;
+      const d = this.hctrlDrag;
+      if (!d) return;
+      if (e.value) { d.p0 = this.hctrlProxy.position.clone(); d.active = true; this.app.beginHillCtrlDrag(); }
+      else if (d.active) { d.active = false; this.app.moveHillCtrl(d.i, {}, true); }
+    });
+    this.hctrlTc.addEventListener('objectChange', () => {
+      const d = this.hctrlDrag, L = this.app.state.layout;
+      if (!d || !d.active || !L) return;
+      const P = this.hctrlProxy.position;
+      const [lx, ly] = L.toLayout(P.x, P.y);
+      const dz = d.dz0 + (P.z - d.p0.z) / Math.max(0.01, this.zExag);
+      if (d.sphere) d.sphere.position.copy(P);
+      this.app.moveHillCtrl(d.i, { x: +lx.toFixed(3), y: +ly.toFixed(3), dz: +dz.toFixed(2) }, false);
+      this.needsFrame = true;
+    });
+    // caja de edición del cerro: gizmo solo en Z para el punto elegido
+    this.latProxy = new THREE.Object3D();
+    this.scene.add(this.latProxy);
+    this.latTc = new TransformControls(this.camera, this.renderer.domElement);
+    this.latTc.setSpace('world');
+    this.latTc.setSize(0.9);
+    this.latTc.showX = false; this.latTc.showY = false;
+    this.scene.add(this.latTc.getHelper());
+    this.latTc.enabled = false;
+    this.latTc.addEventListener('change', () => (this.needsFrame = true));
+    this.latTc.addEventListener('dragging-changed', (e) => {
+      this.controls.enabled = !e.value;
+      const d = this.latDrag;
+      if (!d) return;
+      if (e.value) { d.z0 = this.latProxy.position.z; d.active = true; this.app.beginHillCtrlDrag(); }
+      else if (d.active) { d.active = false; this.app.setHillLatDz(d.i, d.dz, true); }
+    });
+    this.latTc.addEventListener('objectChange', () => {
+      const d = this.latDrag;
+      if (!d || !d.active) return;
+      d.dz = d.dz0 + (this.latProxy.position.z - d.z0) / Math.max(0.01, this.zExag);
+      if (d.sphere) d.sphere.position.z = this.latProxy.position.z;
+      this.app.setHillLatDz(d.i, d.dz, false);
+      this.needsFrame = true;
+    });
+    // bordes de la pista (camino de tierra y barrera), extruidos de la malla de la pista
+    this.edgeGroup = new THREE.Group();
+    this.scene.add(this.edgeGroup);
+    this.collGroup = new THREE.Group(); // geometría de colisión (semitransparente en la vista; invisible al exportar)
+    this.collGroup.name = 'colision';
+    this.scene.add(this.collGroup);
+    this.tunnelRuns = [];
+    // modelo de referencia (FBX / GLB): un solo objeto que se mueve con su propio gizmo
+    this.refExag = new THREE.Group(); // escala Z = exagerar Z (igual que la pista)
+    this.scene.add(this.refExag);
+    this.refOuter = null;
+    this.refTc = new TransformControls(this.camera, this.renderer.domElement);
+    this.refTc.setSpace('world');
+    this.refTc.setSize(1.1);
+    this.scene.add(this.refTc.getHelper());
+    this.refTc.addEventListener('change', () => (this.needsFrame = true));
+    this.refTc.addEventListener('dragging-changed', (e) => { this.controls.enabled = !e.value; if (!e.value && this.app.onRef3dMoveEnd) this.app.onRef3dMoveEnd(); else if (e.value && this.app.onRef3dMoveStart) this.app.onRef3dMoveStart(); });
+    this.refTc.addEventListener('objectChange', () => { if (this.refOuter && this.app.onRef3dMove) { const p = this.refOuter.position; this.app.onRef3dMove([p.x, p.y, p.z], THREE.MathUtils.radToDeg(this.refOuter.rotation.z)); } });
+    const dom = this.renderer.domElement;
+    let down = null;
+    dom.addEventListener('pointerdown', (e) => { down = [e.clientX, e.clientY, e.button]; this.tcUsed = !!this.tc.axis || !!(this.refTc && this.refTc.axis && this.refTc.enabled) || !!(this.hillTc && this.hillTc.axis && this.hillTc.enabled) || !!(this.hctrlTc && this.hctrlTc.axis && this.hctrlTc.enabled) || !!(this.latTc && this.latTc.axis && this.latTc.enabled); });
+    // pintar subdivisión, cerros o ríos directamente sobre el terreno en 3D
+    this.paintMode = null;
+    // aro del pincel: una cinta que se amolda a la superficie (se rehace en cada movimiento)
+    {
+      const N = BRUSH_SEGS, g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array((N + 1) * 2 * 3), 3));
+      const idx = [];
+      for (let i = 0; i < N; i++) { const a = i * 2, b = a + 2; idx.push(a, b, a + 1, a + 1, b, b + 1); }
+      g.setIndex(idx);
+      this.brushRing = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xe040fb, transparent: true, opacity: 0.9, depthTest: false, side: THREE.DoubleSide }));
+    }
+    this.brushRing.frustumCulled = false;
+    this.brushRing.renderOrder = 20;
+    this.brushRing.visible = false;
+    this.scene.add(this.brushRing);
+    const paintHit = (e) => {
+      const L = this.app.state.layout;
+      if (!L) return null;
+      const r = this.renderer.domElement.getBoundingClientRect();
+      const ndc = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+      const ray = new THREE.Raycaster();
+      ray.setFromCamera(ndc, this.camera);
+      let pt = null;
+      const surf = [...(this.hillMeshes || []), ...(this.wallMeshes || []), ...(this.terrainMesh ? [this.terrainMesh] : [])];
+      if (surf.length) { const h = ray.intersectObjects(surf, false); if (h.length) { pt = h[0].point; pt.hillId = h[0].object.userData.hillId ?? h[0].object.userData.wallHill ?? null; } }
+      if (!pt) { const h = ray.intersectObjects(this.trackGroup.children, false); if (h.length) pt = h[0].point; }
+      if (!pt) { const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0); pt = new THREE.Vector3(); if (!ray.ray.intersectPlane(plane, pt)) return null; }
+      return pt;
+    };
+    const moveRing = (pt) => {
+      const sc = this.app.state.scene;
+      const rm = this.paintMode === 'hill' ? sc.hillBrush : this.paintMode === 'sculpt' ? sc.sculptBrush : this.paintMode === 'river' ? sc.riverBrush : this.paintMode === 'tsmooth' ? sc.tsmoothBrush : sc.paintBrush;
+      this.shapeBrushRing(pt, rm);
+      this.brushRing.material.color.set(this.paintMode === 'tsmooth' ? 0x9cff8a : this.paintMode === 'hill' ? 0xe0a050 : this.paintMode === 'river' ? 0x3fa7ff : this.paintMode === 'sculpt' ? 0x7ec8ff : this.paintMode === 'itemPaint' ? this.app.itemPaintColor() : 0xe040fb);
+      this.brushRing.visible = true;
+      this.needsFrame = true;
+    };
+    this.el.addEventListener('pointermove', (e) => {
+      // con Shift se navega (el aro del pincel se oculta mientras tanto)
+      if (!this.paintMode || e.shiftKey || this.navPaint || (this.game && this.game.active)) { if (this.brushRing.visible) { this.brushRing.visible = false; this.needsFrame = true; } return; }
+      const pt = paintHit(e);
+      if (pt) moveRing(pt);
+    });
+    this.el.addEventListener('pointerdown', (e) => {
+      if (this.paintMode && e.shiftKey && !(this.game && this.game.active)) {
+        // pintando, Shift = navegar como siempre: izquierdo gira, derecho desplaza, rueda / medio acercan. OrbitControls
+        // invierte girar y desplazar con Shift, así que se invierten los botones mientras dura el arrastre
+        const mb = this.controls.mouseButtons, keep = { LEFT: mb.LEFT, RIGHT: mb.RIGHT };
+        mb.LEFT = THREE.MOUSE.PAN; mb.RIGHT = THREE.MOUSE.ROTATE;
+        this.navPaint = true;
+        this.controls.enabled = true;
+        const up = () => { window.removeEventListener('pointerup', up, true); window.removeEventListener('pointercancel', up, true); setTimeout(() => { mb.LEFT = keep.LEFT; mb.RIGHT = keep.RIGHT; this.navPaint = false; }, 0); };
+        window.addEventListener('pointerup', up, true);
+        window.addEventListener('pointercancel', up, true);
+        return;
+      }
+      if (!this.paintMode || (e.button !== 0 && e.button !== 2) || (this.game && this.game.active)) return;
+      e.stopPropagation(); e.preventDefault();
+      this.controls.enabled = false;
+      const L = this.app.state.layout;
+      const ses = { kind: this.paintMode, erase: e.button === 2 || e.altKey || (this.paintMode !== 'sculpt' && this.paintMode !== 'tsmooth' && this.app.state.paintErase), ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey, last: null };
+      const pt0 = paintHit(e);
+      this.app.beginPaint(ses.kind, ses, pt0 && L ? L.toLayout(pt0.x, pt0.y) : null, pt0 ? pt0.hillId : null);
+      const stroke = (ev) => {
+        const pt = paintHit(ev);
+        if (!pt || !L) return;
+        moveRing(pt);
+        this.app.addStroke(ses, L.toLayout(pt.x, pt.y));
+        this.app.onPaintProgress && this.app.onPaintProgress();
+      };
+      stroke(e);
+      const move = (ev) => stroke(ev);
+      const up = () => {
+        window.removeEventListener('pointermove', move, true);
+        window.removeEventListener('pointerup', up, true);
+        this.controls.enabled = true;
+        this.app.endPaint(ses.kind, ses);
+      };
+      window.addEventListener('pointermove', move, true);
+      window.addEventListener('pointerup', up, true);
+    }, true);
+    this.el.addEventListener('contextmenu', (e) => { if (this.paintMode) e.preventDefault(); });
+    // Shift + clic / arrastrar: selección múltiple (se captura antes que OrbitControls)
+    this.el.style.position = 'relative';
+    this.el.addEventListener('pointerdown', (e) => {
+      if (this.app.state.tool !== 'edit' || !(e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) || e.button !== 0 || this.tc.axis) return;
+      e.stopPropagation();
+      e.preventDefault();
+      this.controls.enabled = false;
+      const r = this.el.getBoundingClientRect();
+      this.box = { x0: e.clientX - r.left, y0: e.clientY - r.top, x1: e.clientX - r.left, y1: e.clientY - r.top, add: e.ctrlKey || e.metaKey, sub: e.altKey, ev: e };
+      const div = document.createElement('div');
+      div.className = 'select-box';
+      this.el.appendChild(div);
+      this.box.div = div;
+      const move = (ev) => {
+        this.box.x1 = ev.clientX - r.left; this.box.y1 = ev.clientY - r.top;
+        const b = this.box;
+        Object.assign(div.style, { left: `${Math.min(b.x0, b.x1)}px`, top: `${Math.min(b.y0, b.y1)}px`, width: `${Math.abs(b.x1 - b.x0)}px`, height: `${Math.abs(b.y1 - b.y0)}px` });
+      };
+      const up = (ev) => {
+        window.removeEventListener('pointermove', move, true);
+        window.removeEventListener('pointerup', up, true);
+        const b = this.box;
+        this.box = null;
+        div.remove();
+        this.controls.enabled = true;
+        const segMode = this.app.state.subObj === 'segment';
+        if (segMode && Math.abs(b.x1 - b.x0) + Math.abs(b.y1 - b.y0) < 5) {
+          const sh = this.pickSegment(ev);
+          if (sh && b.sub) this.app.segSelectMany({ key: sh.key, segs: [sh.seg] }, 'sub'); else if (sh) this.app.clickSegSel(sh, b.ev);
+          return;
+        }
+        if (Math.abs(b.x1 - b.x0) + Math.abs(b.y1 - b.y0) < 5) {
+          const hit = this.pickHandle(ev);
+          if (hit && !b.sub) this.app.clickMultiSel(hit, b.ev);
+          else if (hit && b.sub) this.app.subtractMultiSel({ key: hit.key, idxs: [hit.idx] });
+          return;
+        }
+        const [ax, bx] = [Math.min(b.x0, b.x1), Math.max(b.x0, b.x1)], [ay, by] = [Math.min(b.y0, b.y1), Math.max(b.y0, b.y1)];
+        const v = new THREE.Vector3();
+        const inside = [];
+        for (const m of this.handleGroup.children) {
+          v.copy(m.position).project(this.camera);
+          if (v.z > 1) continue;
+          const sx = (v.x + 1) / 2 * r.width, sy = (1 - v.y) / 2 * r.height;
+          if (sx >= ax && sx <= bx && sy >= ay && sy <= by) inside.push({ key: m.userData.key, idx: m.userData.idx });
+        }
+        if (segMode) this.app.segSelectMany(this.app.pickBest(inside), b.sub ? 'sub' : true, true);
+        else if (b.sub) this.app.subtractMultiSel(this.app.pickBest(inside)); else this.app.setMultiSel(this.app.pickBest(inside), b.add);
+      };
+      window.addEventListener('pointermove', move, true);
+      window.addEventListener('pointerup', up, true);
+    }, true);
+    dom.addEventListener('pointerup', (e) => {
+      if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) { down = null; return; }
+      if (down && this.app.state.tool === 'pan' && down[2] === 0 && !this.tcUsed && Math.hypot(e.clientX - down[0], e.clientY - down[1]) < 4 && !(this.game && this.game.active)) {
+        down = null;
+        this.pickHill(e);
+        return;
+      }
+      if (!down || this.app.state.tool !== 'edit') return;
+      const moved = Math.hypot(e.clientX - down[0], e.clientY - down[1]);
+      const btn = down[2];
+      down = null;
+      if (moved > 4 || this.tcUsed || btn !== 0) return;
+      this.pick(e);
+    });
+    // doble clic en la vista 3D: entra a «Editar puntos» con el punto más cercano
+    dom.addEventListener('dblclick', (e) => {
+      if (this.app.state.tool === 'edit' || (this.game && this.game.active)) return;
+      const r = dom.getBoundingClientRect();
+      const ndc = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+      const ray = new THREE.Raycaster();
+      ray.setFromCamera(ndc, this.camera);
+      const objs = [...this.trackGroup.children, ...(this.terrainMesh ? [this.terrainMesh] : []), ...(this.hillMeshes || [])];
+      const h = ray.intersectObjects(objs, false);
+      let pt = h.length ? h[0].point : null;
+      if (!pt) { const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0); pt = new THREE.Vector3(); if (!ray.ray.intersectPlane(plane, pt)) return; }
+      this.app.enterEditAtWorld(pt.x, pt.y);
+    });
+    new ResizeObserver(() => this.resize()).observe(container);
+    this.controls.addEventListener('change', () => (this.needsFrame = true));
+    this.clock = new THREE.Clock();
+    this.game = null; // cámara de juego (se asigna desde gamecam.js)
+    this.triCounts = { track: 0, terrain: 0, trees: 0 };
+    this.statsDiv = document.createElement('div');
+    this.statsDiv.className = 'tri-stats';
+    container.appendChild(this.statsDiv);
+    this.wire = { on: false, color: '#ffffff', opacity: 0.35 };
+    const loop = () => {
+      const dt = Math.min(0.1, this.clock.getDelta());
+      if (this.game && this.game.active) {
+        this.game.update(dt);
+        if (this.coinSpins && this.coinSpins.length) { this.coinAngle = ((this.coinAngle || 0) + dt * 3) % (Math.PI * 2); for (const sp of this.coinSpins) sp.rotation.z = this.coinAngle; } // monedas girando
+        this.renderer.render(this.scene, this.game.camera);
+      } else {
+        this.controls.update();
+        if (this.needsFrame) { this.renderer.render(this.scene, this.camera); this.needsFrame = false; }
+      }
+      requestAnimationFrame(loop);
+    };
+    loop();
+  }
+
+  resize() {
+    const r = this.el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return;
+    this.renderer.setSize(r.width, r.height);
+    this.camera.aspect = r.width / r.height;
+    this.camera.updateProjectionMatrix();
+    if (this.game) this.game.resize(r.width / r.height);
+    this.needsFrame = true;
+  }
+
+  updateStats() {
+    const f = (n) => n.toLocaleString('es');
+    const t = this.triCounts;
+    const sp = this.app.state.scene;
+    const tun = t.tunnels || 0, hills = t.hills || 0, gate = t.gate || 0, grass = t.grass || 0;
+    const edges = t.edges || 0, deco = t.deco || 0, rivers = t.rivers || 0, shadows = t.shadows || 0, signs = sp.signs ? t.signs || 0 : 0;
+    const total = t.track + (sp.terrain ? t.terrain : 0) + (t.trees || 0) + tun + hills + gate + grass + edges + deco + rivers + shadows + signs;
+    const ot = this.objTris || { hills: new Map(), tunnels: new Map() };
+    const st = this.app.state;
+    const nH = ot.hills.size, nT = ot.tunnels.size;
+    const selIt = st.selItem ? this.findItem(st.selItem) : null;
+    const selObj = selIt ? { name: selIt.name, tris: selIt.indices.length / 3 } : st.selHill != null ? ot.hills.get(st.selHill) : st.selTunnel != null ? ot.tunnels.get(st.selTunnel) : null;
+    const selTxt = selObj ? `<div class="sel"><b>Seleccionado</b> · ${selObj.name}: ${f(selObj.tris)} triángulos</div>` : '';
+    const cT = this.collData && this.app.state.scene.collision ? this.collData.tris : 0; // colisión: otra línea, en celeste
+    const collTxt = cT ? `<div class="coll"><b>Colisión</b> · ${f(cT)} triángulos</div>` : '';
+    this.statsDiv.innerHTML = `<b>Triángulos</b> · pista ${f(t.track)}${edges ? ` · bordes ${f(edges)}` : ''}${sp.terrain ? ` · terreno ${f(t.terrain)}` : ''}${hills || tun ? ` · cerros + túneles ${f(hills + tun)} (${[hills ? `${nH} cerro${nH === 1 ? '' : 's'}: ${f(hills)}` : '', tun ? `${nT} túnel${nT === 1 ? '' : 'es'}: ${f(tun)}` : ''].filter(Boolean).join(' · ')})` : ''}${rivers ? ` · ríos y cascadas ${f(rivers)}` : ''}${t.trees ? ` · árboles ${f(t.trees)}` : ''}${grass ? ` · hierba ${f(grass)}` : ''}${gate ? ` · pórtico ${f(gate)}` : ''}${signs ? ` · señalética ${f(signs)}` : ''}${t.items ? ` · elementos ${f(t.items)} (${this.itemCount})` : ''}${deco ? ` · decoración ${f(deco)}` : ''}${shadows ? ` · sombras ${f(shadows)}` : ''} · <b>total ${f(total + (t.items || 0))}</b>${selTxt}${collTxt}`;
+  }
+
+  /** Wireframe superpuesto (color y opacidad elegibles) sobre pista, terreno y árboles. */
+  applyWireframe() {
+    for (const grp of [this.trackGroup, this.extras, this.edgeGroup]) {
+      for (const m of [...grp.children]) {
+        if (!m.isMesh || m.userData.texOverlay) continue; // la capa de textura ya va desplazada sobre la base
+        let w = m.children.find((c) => c.userData.wire);
+        if (!this.wire.on) { if (w) { m.remove(w); w.material.dispose(); } continue; }
+        if (!w) {
+          w = new THREE.Mesh(m.geometry, new THREE.MeshBasicMaterial({ wireframe: true, transparent: true, depthWrite: false }));
+          w.userData.wire = true;
+          w.renderOrder = 5;
+          m.add(w);
+        }
+        w.material.color.set(this.wire.color);
+        w.material.opacity = this.wire.opacity;
+        w.material.needsUpdate = true;
+        // desplaza el sólido para que las líneas no parpadeen
+        m.material.polygonOffset = true;
+        m.material.polygonOffsetFactor = grp === this.trackGroup ? 2 : 1;
+        m.material.polygonOffsetUnits = grp === this.trackGroup ? 2 : 1;
+      }
+    }
+    // capa de textura de la pista: entre la base (+2) y las líneas (0); sin wireframe va delante de la base (-1).
+    // (el desplazamiento de polígonos no se aplica a las líneas, por eso la textura se aleja en vez de acercar las líneas)
+    for (const m of this.trackGroup.children) {
+      if (!m.userData.texOverlay) continue;
+      for (const mt of Array.isArray(m.material) ? m.material : [m.material]) {
+        mt.polygonOffset = true;
+        mt.polygonOffsetFactor = this.wire.on ? 1 : -1;
+        mt.polygonOffsetUnits = this.wire.on ? 1 : -1;
+        mt.needsUpdate = true;
+      }
+    }
+    this.needsFrame = true;
+  }
+
+  clear() {
+    for (const c of [...this.group.children]) {
+      this.group.remove(c);
+      c.geometry?.dispose();
+      c.material?.dispose();
+    }
+  }
+
+  update(fitView = false, keepExtras = false) {
+    const L = this.app.state.layout, E = this.app.state.result;
+    this.clear();
+    if (!L || !E) { this.needsFrame = true; return; }
+    const ex = this.zExag;
+    const v = E.validation;
+    const span = Math.max(v.zMax - v.zMin, 0.5);
+    const col = new THREE.Color();
+    const bbox = new THREE.Box3();
+    // malla de la pista (con UV) en metros reales; la exageración se aplica como escala del grupo
+    this.disposeGroup(this.trackGroup);
+    this.trackGroup.scale.set(1, 1, ex);
+    this.refExag.scale.set(1, 1, ex);
+    const sp = this.app.state.scene;
+    // tramos cubiertos (túneles de la última reconstrucción y bajo cruces): material propio
+    this.coveredCache = coveredRanges(L, E, this.tunnelRuns);
+    this.app.state.coveredRanges = this.coveredCache;
+    const tm = buildTrackMesh(L, E, { ...sp, skirts: sp.terrain && sp.skirts, coveredRanges: this.coveredCache });
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(tm.positions, 3));
+    g.setAttribute('uv', new THREE.BufferAttribute(tm.uvs, 2));
+    g.setIndex(tm.indices);
+    g.computeVertexNormals();
+    // base: colores por altura; encima, la textura (la del usuario o la de asfalto por defecto) con su opacidad
+    const colors = new Float32Array(tm.positions.length);
+    for (let i = 0; i < tm.positions.length / 3; i++) {
+      const t = (tm.positions[i * 3 + 2] - v.zMin) / span;
+      col.setHSL(0.62 - 0.55 * t, 0.55, 0.5);
+      colors[i * 3] = col.r; colors[i * 3 + 1] = col.g; colors[i * 3 + 2] = col.b;
+    }
+    g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    const m = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 0.85, metalness: 0 });
+    this.trackGroup.add(new THREE.Mesh(g, m));
+    const op = Math.max(0, Math.min(1, sp.trackTexOpacity ?? 1));
+    if (op > 0.001) {
+      if (!this.asphaltCanvas) this.asphaltCanvas = makeAsphaltCanvas();
+      const tex = this.texture(this.app.state.trackTex || this.asphaltCanvas);
+      if (!this.bridgeCanvas) this.bridgeCanvas = makeBridgeCanvas();
+      const btex = this.texture(this.app.state.bridgeTex || this.bridgeCanvas);
+      const atex = tex; // atajos sin textura propia: la de la pista
+      const ctex = this.texture(this.app.coveredTexCanvas ? this.app.coveredTexCanvas() : null) || tex;
+      const ovMat = (map) => new THREE.MeshStandardMaterial({ map, side: THREE.DoubleSide, roughness: 0.9, metalness: 0, transparent: op < 0.999, opacity: op, depthWrite: op >= 0.999, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
+      // grupos: pista, atajos, tramos cubiertos (túneles y bajo cruces) y tableros de puente, cada uno con su textura;
+      // cada atajo con textura propia usa su material (índices 4 en adelante)
+      g.clearGroups();
+      const stex = this.texture(this.app.suspTexCanvas ? this.app.suspTexCanvas() : null) || tex; // tramos suspendidos
+      const mats = [ovMat(tex), ovMat(atex), ovMat(ctex), ovMat(btex), ovMat(stex)];
+      for (const gr of tm.groups) {
+        if (!gr.count) continue;
+        if (gr.mat === 3 && tm.bridgeGroups && this.app.bridgeDeckCanvas) { // cada puente con su material de piso
+          for (const bg of tm.bridgeGroups) {
+            if (!bg.count) continue;
+            mats.push(ovMat(this.texture(this.app.bridgeDeckCanvas(bg.bridge))));
+            g.addGroup(bg.start, bg.count, mats.length - 1);
+          }
+          continue;
+        }
+        if (gr.mat === 5) { // transiciones entre tramos: cada una con su textura
+          for (const tg of tm.transGroups || []) {
+            if (!tg.count) continue;
+            const cv = this.app.transTexCanvas ? this.app.transTexCanvas(tg.bridge, tg.end) : null;
+            const tt = cv ? this.texture(cv) : tex;
+            mats.push(ovMat(tt));
+            g.addGroup(tg.start, tg.count, mats.length - 1);
+          }
+          continue;
+        }
+        if (gr.mat !== 1 || !tm.altGroups) { g.addGroup(gr.start, gr.count, gr.mat); continue; }
+        for (const ag of tm.altGroups) {
+          if (!ag.count) continue;
+          const own = this.app.altOwnTex ? this.app.altOwnTex(L.routes[ag.k], 'track') : null;
+          let mi = 1;
+          if (own) { mats.push(ovMat(this.texture(own))); mi = mats.length - 1; }
+          g.addGroup(ag.start, ag.count, mi);
+        }
+      }
+      const ov = new THREE.Mesh(g, mats);
+      ov.userData.texOverlay = true;
+      this.trackGroup.add(ov);
+    }
+    // atajo seleccionado: la calzada se ilumina en amarillo (malla compartida, solo el grupo de ese atajo)
+    {
+      const si = this.app.state.selAlt;
+      const ag = si != null && tm.altGroups ? tm.altGroups.find((q) => L.routes[q.k] && L.routes[q.k].altIndex === si) : null;
+      if (ag && ag.count) {
+        const hg = new THREE.BufferGeometry();
+        hg.setAttribute('position', g.getAttribute('position'));
+        hg.setIndex(g.getIndex());
+        hg.addGroup(ag.start, ag.count, 0);
+        const hm = new THREE.Mesh(hg, [new THREE.MeshBasicMaterial({ color: 0xffe066, transparent: true, opacity: 0.22, depthWrite: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 })]);
+        hm.userData.altHi = true;
+        hm.renderOrder = 6;
+        this.trackGroup.add(hm);
+      }
+    }
+    this.triCounts.track = tm.indices.length / 3;
+    this.buildEdges(false);
+    if (this.app.onTrackMeshInfo) {
+      const rowsN = tm.rows.reduce((a, b) => a + b, 0);
+      let uniTris = null;
+      if (sp.trackMeshMode === 'optimized') uniTris = trackRows(L, E, { ...sp, skirts: sp.terrain && sp.skirts, trackMeshMode: 'uniform' }).reduce((a, q) => a + (q.length - 1), 0) * (trackCols({ ...sp, skirts: sp.terrain && sp.skirts }) - 1) * 2;
+      const samples = L.routes.reduce((a, r) => a + (r.closed ? r.n + 1 : r.n), 0);
+      this.app.onTrackMeshInfo({ rows: rowsN, tris: tm.indices.length / 3, uniTris, samples });
+    }
+    this.updateStats();
+    this.applyWireframe();
+    g.computeBoundingBox();
+    bbox.min.set(g.boundingBox.min.x, g.boundingBox.min.y, g.boundingBox.min.z * ex);
+    bbox.max.set(g.boundingBox.max.x, g.boundingBox.max.y, g.boundingBox.max.z * ex);
+    L.routes.forEach((r, k) => {
+      const { left, right } = edgeSamples(L, E, k);
+      // bordes
+      for (const arr of [left, right]) {
+        const pts = arr.map((p) => new THREE.Vector3(p.x, p.y, p.z * ex + 0.15));
+        if (r.closed) pts.push(pts[0].clone());
+        const lg = new THREE.BufferGeometry().setFromPoints(pts);
+        const selA = r.kind === 'alt' && r.altIndex === this.app.state.selAlt;
+        this.group.add(new THREE.Line(lg, new THREE.LineBasicMaterial({ color: selA ? 0xffe066 : r.kind === 'alt' ? 0x4fb3ff : 0xf5f5f5, transparent: selA, opacity: selA ? 0.6 : 1 })));
+      }
+    });
+    // puente seleccionado: bordes iluminados en amarillo
+    {
+      const sb = this.app.state.selBridge, r0 = L.routes[0];
+      const b = sb != null && r0.bridges ? (r0.bridges.find((q) => q.idx === sb) || null) : null;
+      if (b) {
+        const { left, right } = edgeSamples(L, E, 0);
+        const i0 = Math.round(b.s0 / r0.ds), i1 = Math.round(b.s1 / r0.ds);
+        for (const arr of [left, right]) {
+          const pts = [];
+          for (let i = i0; i <= i1; i++) { const q = arr[((i % r0.n) + r0.n) % r0.n]; pts.push(new THREE.Vector3(q.x, q.y, q.z * ex + 0.4)); }
+          const lg = new THREE.BufferGeometry().setFromPoints(pts);
+          const ln = new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0xffe066, linewidth: 3, depthTest: false, transparent: true, opacity: 0.6 }));
+          ln.renderOrder = 12; ln.userData.bridgeHi = true;
+          this.group.add(ln);
+        }
+      }
+    }
+    this.buildPillars();
+    // suelo
+    if (this.grid) { this.scene.remove(this.grid); this.grid.geometry.dispose(); }
+    const size = Math.max(bbox.max.x - bbox.min.x, bbox.max.y - bbox.min.y) * 1.4 || 1000;
+    this.grid = new THREE.GridHelper(size, 28, 0x333a48, 0x1f2430);
+    this.grid.rotation.x = Math.PI / 2;
+    this.grid.position.set((bbox.min.x + bbox.max.x) / 2, (bbox.min.y + bbox.max.y) / 2, (v.zMin - 2) * ex);
+    this.scene.add(this.grid);
+    this.grid.visible = !this.app.state.scene.terrain;
+    this.bbox = bbox;
+    if (fitView || !this.fitted) this.fit();
+    this.buildItems();
+    this.buildTriggerMeshes();
+    this.updateHandles();
+    if (keepExtras && this.extras.children.length) { this.applyExag(); this.buildPillars(); }
+    else this.scheduleExtras();
+    this.needsFrame = true;
+  }
+
+  disposeGroup(grp) {
+    for (const c of [...grp.children]) {
+      grp.remove(c);
+      c.traverse((o) => {
+        o.geometry?.dispose();
+        for (const mt of Array.isArray(o.material) ? o.material : o.material ? [o.material] : []) if (!mt.userData.keep) mt.dispose();
+      });
+    }
+  }
+
+  texture(canvas) {
+    if (!canvas) return null;
+    let t = this.texCache.get(canvas);
+    if (!t) {
+      t = new THREE.CanvasTexture(canvas);
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      t.colorSpace = THREE.SRGBColorSpace;
+      t.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
+      this.texCache.set(canvas, t);
+    }
+    return t;
+  }
+
+  buildPillars() {
+    const L = this.app.state.layout, E = this.app.state.result;
+    this.disposeGroup(this.pillars);
+    if (!L || !E) return;
+    const ex = this.zExag;
+    const v = E.validation;
+    const T = this.app.state.scene.terrain ? this.terrainData : null;
+    E.crossings.forEach((c) => {
+      const upR = c.up === 'a' ? c.ra : c.rb;
+      const upS = c.up === 'a' ? c.sa : c.sb;
+      const r = L.routes[upR];
+      const lc = L.crossings[c.id];
+      const Rw = (lc && lc.window) || 15;
+      for (const off0 of [-Rw * 1.25, Rw * 1.25]) {
+        // se aleja del cruce hasta un lugar donde el pilar no pise otra calzada, su camino de tierra ni un atajo
+        let i = -1;
+        for (let q = 0; q < 16; q++) {
+          const off = off0 + Math.sign(off0) * q * 2.5;
+          const ii = ((Math.round((upS + off) / r.ds) % r.n) + r.n) % r.n;
+          if (!pillarBlocked(L, E, this.app.state.scene, r.x[ii], r.y[ii], 2, E.routes[upR].z[ii] - 0.5, upR, r.s[ii])) { i = ii; break; }
+        }
+        if (i < 0) continue;
+        const zTop = E.routes[upR].z[i] * ex - 0.5;
+        const zBot = (T ? T.sample(r.x[i], r.y[i]) : v.zMin - 2) * ex;
+        const h = zTop - zBot;
+        if (h <= 0.5) continue;
+        const p = new THREE.Mesh(new THREE.BoxGeometry(2, 2, h), new THREE.MeshStandardMaterial({ color: 0x6b7385, roughness: 0.9 }));
+        p.position.set(r.x[i], r.y[i], zBot + h / 2);
+        this.pillars.add(p);
+      }
+    });
+    // pilares bajo los puentes creados a mano (cada ~18 m, si hay altura bajo la calzada)
+    for (const pl of bridgePillars(L, E, T, this.app.state.scene)) {
+      const zTop = pl.zTop * ex, zBot = pl.zBot * ex, h = zTop - zBot;
+      if (h <= 0.5) continue;
+      const p = new THREE.Mesh(new THREE.BoxGeometry(pl.size, pl.size, h), new THREE.MeshStandardMaterial({ color: 0x7a818f, roughness: 0.9 }));
+      p.position.set(pl.x, pl.y, zBot + h / 2);
+      p.rotation.z = pl.angle;
+      this.pillars.add(p);
+    }
+    // pilares de los tramos suspendidos (hasta el suelo: terreno o cerros)
+    const sp = this.app.state.scene;
+    if (sp.suspRanges && sp.suspRanges.length) {
+      const k = ex - 1, T0 = this.terrainData;
+      const mat = new THREE.MeshStandardMaterial({ color: 0x8a8f99, roughness: 0.85 });
+      for (const pl of suspPillars(L, E, sp, this.groundCache || null)) {
+        // con exageración Z: arriba sigue a la pista, abajo al suelo exagerado
+        const tz = T0 ? T0.sample(pl.x, pl.y) : pl.zBot;
+        const zTop = pl.zTop * ex, zBot = pl.zBot + (Number.isFinite(tz) ? tz : pl.zBot) * k, h = zTop - zBot;
+        if (h <= 0.3) continue;
+        const p = new THREE.Mesh(new THREE.BoxGeometry(pl.size, pl.size, h), mat);
+        p.position.set(pl.x, pl.y, zBot + h / 2);
+        p.rotation.z = pl.angle;
+        p.userData.susp = pl.zone;
+        this.pillars.add(p);
+      }
+    }
+  }
+
+  /** Terreno y árboles se recalculan con una pequeña espera (son más pesados). */
+  scheduleExtras() {
+    clearTimeout(this.extrasTimer);
+    this.extrasTimer = setTimeout(() => { this.extrasTimer = null; this.buildExtras(); }, 220);
+  }
+
+  /**
+   * Marca una malla para la exageración Z: z' = z + shift·(ex − 1).
+   * shift = z (se estira todo, como el terreno) o la altura del suelo bajo cada vértice (la forma queda intacta y solo se apoya).
+   */
+  markExag(mesh, shiftFn) {
+    const pos = mesh.geometry.getAttribute('position');
+    const base = new Float32Array(pos.array);
+    const shift = new Float32Array(pos.count);
+    for (let v = 0; v < pos.count; v++) shift[v] = shiftFn(base[v * 3], base[v * 3 + 1], base[v * 3 + 2], v);
+    mesh.userData.exag = { base, shift };
+  }
+
+  /** Aplica la exageración Z actual a las mallas marcadas (sin reconstruirlas). */
+  applyExag() {
+    const k = this.zExag - 1;
+    this.extras.traverse((o) => {
+      const ex = o.userData && o.userData.exag;
+      if (ex && o.geometry) {
+        const pos = o.geometry.getAttribute('position');
+        const a = pos.array;
+        for (let v = 0; v < pos.count; v++) a[v * 3 + 2] = ex.base[v * 3 + 2] + ex.shift[v] * k;
+        pos.needsUpdate = true;
+        o.geometry.computeVertexNormals();
+        o.geometry.computeBoundingSphere();
+        o.geometry.computeBoundingBox();
+      }
+      const eo = o.userData && o.userData.exagObj;
+      if (eo) o.position.z = eo.z + eo.shift * k;
+    });
+    this.buildDeco(false);
+    this.needsFrame = true;
+  }
+
+  /**
+   * Decoración: sets de elementos (cubos de color o modelos) y árboles / hierba con modelos, como InstancedMesh.
+   * Se apoyan en el suelo exagerado sin estirarse.
+   */
+  buildDeco(stats = true) {
+    if (!this.decoGroup) { this.decoGroup = new THREE.Group(); this.scene.add(this.decoGroup); }
+    for (const c of [...this.decoGroup.children]) { this.decoGroup.remove(c); c.traverse((o) => { if (o.isInstancedMesh) o.dispose(); }); } // la geometría es del asset: no se libera
+    this.triCounts.deco = 0;
+    const L = this.app.state.layout, E = this.app.state.result, sp = this.app.state.scene;
+    if (!L || !E || !this.app.assetById) return;
+    const T0 = this.terrainData, k = this.zExag - 1;
+    const zOf = (it) => { if (it.wat === 1) return it.z * (1 + k) + 0.25; const t = T0 ? T0.sample(it.x, it.y) : it.z; return it.z + (Number.isFinite(t) ? t : it.z) * k; }; // (sobre ríos, lagos o el mar: se estira como el agua)
+    const byId = (id) => this.app.assetById(id);
+    const add = (items, ud) => {
+      if (!items || !items.length) return;
+      const g = instancedGroup(byId, items, zOf);
+      g.traverse((o) => { if (o.isInstancedMesh) Object.assign(o.userData, ud); });
+      this.decoGroup.add(g);
+    };
+    const vm = this.vegModels || {};
+    this.decoItemsBySet = {};
+    if (sp.trees) add(vm.trees, { veg: 'trees', vegEdit: sp.treeSingle === false ? { kind: 'tree' } : null });
+    for (const q of vm.treesOther || []) add(q.items, { veg: 'trees', vegGroup: q.g });
+    for (const q of Array.isArray(vm.grass) ? vm.grass : []) add(q.items, { veg: 'grass', vegGroup: q.g, vegEdit: q.edit ? { kind: 'grass' } : null });
+    const sets = [...(this.app.state.decoSets || []), ...(this.app.riverDecoSets ? this.app.riverDecoSets() : [])]; // (0.88: y la decoración de ríos y lagos)
+    if (sets.length) {
+      const res = decoSetItems(L, E, sp, this.groundCache || null, sets, (set) => this.app.decoPaintWorld(set), (id) => !!byId(id));
+      this.decoCounts = {};
+      for (const { set, items } of res) {
+        add(items, { decoSet: set.id, vegEdit: set.single === false ? { kind: 'deco', set: set.id } : null });
+        this.decoItemsBySet[set.id] = items;
+        const tris = items.reduce((a, it) => a + (byId(it.asset) ? byId(it.asset).tris : 0), 0);
+        this.decoCounts[set.id] = { count: items.length, tris };
+        this.triCounts.deco += tris;
+      }
+      if (this.app.onDecoInfo) this.app.onDecoInfo(this.decoCounts);
+    }
+    if (stats) this.updateStats();
+    if (this.app.state.selVeg) this.updateHandles(); // el marcador y el gizmo siguen al elemento seleccionado
+    this.needsFrame = true;
+  }
+
+  buildExtras() {
+    const L = this.app.state.layout, E = this.app.state.result;
+    const sp = this.app.state.scene;
+    this.app.state.groundLine = null;
+    this.disposeGroup(this.extras);
+    if (this.paintOverlay) { for (const c of [...this.paintOverlay.children]) { this.paintOverlay.remove(c); if (c.userData.ownGeo) c.geometry.dispose(); } this.paintOverlay.userData.key = null; }
+    // la exageración Z se aplica por vértice (applyExag): terreno y pista se estiran; cerros, túneles, árboles, hierba y pórtico no
+    this.extras.scale.set(1, 1, 1);
+    this.terrainData = null;
+    this.terrainMesh = null;
+    this.waterMesh = null;
+    this.hillMeshes = [];
+    this.tunnelMeshes = [];
+    this.tunnelDecoMeshes = []; // decoración de pared (materiales compartidos: no se resaltan, pero se eligen con clic)
+    this.caveMeshes = []; // rocas y estalactitas sueltas (túneles sin «single mesh»)
+    this.treeMesh = null; this.treeData = null; // árboles (buildTreeMesh)
+    this.grassMeshes = []; this.grassMesh = null; this.grassData = null; // hierba (buildGrassMesh)
+    this.waterSampler = null; // superficie del agua (ríos, lagos, cascadas; el mar lo agrega makeGround)
+    this.tunnelGeoById = new Map();
+    this.hillData = null;
+    this.objTris = { hills: new Map(), tunnels: new Map() };
+    const info = { terrainTris: 0, terrainCell: 0, trees: 0, ms: 0, tunnelTris: 0, tunnels: [], hills: [], hillTris: 0, gateTris: 0 };
+    if (!L || !E) { this.needsFrame = true; return; }
+    const t0 = performance.now();
+    const hillsW = this.app.hillsWorld ? this.app.hillsWorld() : null;
+    const mkGeo = (geo) => {
+      const bg = new THREE.BufferGeometry();
+      bg.setAttribute('position', new THREE.BufferAttribute(geo.positions, 3));
+      if (geo.uvs) bg.setAttribute('uv', new THREE.BufferAttribute(geo.uvs, 2));
+      bg.setIndex(geo.indices instanceof Uint32Array ? new THREE.BufferAttribute(geo.indices, 1) : geo.indices);
+      bg.computeVertexNormals();
+      return bg;
+    };
+    const add = (geo, mat, grp = this.extras) => {
+      if (!geo.indices.length) return 0;
+      grp.add(new THREE.Mesh(mkGeo(geo), mat));
+      return geo.indices.length / 3;
+    };
+    const tex = this.texture(this.app.state.terrainTex);
+    let newRuns = [];
+    this.trigTunnels = [];
+    const riversW = this.app.riversWorld ? this.app.riversWorld() : null;
+    this.riverMeshes = [];
+    this.wallMeshes = [];
+    if (sp.terrain || (hillsW && hillsW.length) || (riversW && riversW.length)) {
+      const T = buildTerrain(L, E, sp, this.app.terrainPaintWorld ? this.app.terrainPaintWorld() : null);
+      this.terrainData = T;
+      if (sp.terrain) {
+        const cols = terrainTint(T, !!tex);
+        const m = tex
+          ? new THREE.MeshStandardMaterial({ map: tex, roughness: 1, metalness: 0, vertexColors: !!cols })
+          : new THREE.MeshStandardMaterial({ color: cols ? 0xffffff : 0x4f7d3a, roughness: 1, metalness: 0, vertexColors: !!cols });
+        const tgeo = mkGeo(T.baseIndices ? { ...T, indices: T.baseIndices } : T); // sin cauces ni paredes socavadas (van aparte)
+        if (cols) tgeo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+        const tmesh = new THREE.Mesh(tgeo, m);
+        tmesh.userData.terrain = true;
+        this.markExag(tmesh, (x, y, z) => z);
+        this.terrainMesh = tmesh;
+        this.extras.add(tmesh);
+        // paredes de las secciones socavadas: artificiales (lisas) o naturales (roca)
+        // una malla por tramo: cada uno con su textura propia o la general de su tipo (un material por textura)
+        const wallMats = new Map();
+        const wallMat = (kind, cv) => {
+          const key = kind + ':' + (cv ? (cv.__uid || (cv.__uid = Math.random().toString(36).slice(2))) : '-');
+          if (wallMats.has(key)) return wallMats.get(key);
+          const t = this.texture(cv);
+          if (t) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.needsUpdate = true; }
+          const mat = new THREE.MeshStandardMaterial({ map: t, color: t ? 0xffffff : kind === 'art' ? 0x9c9d98 : 0x6b6158, roughness: kind === 'art' ? 0.85 : 1, metalness: 0, flatShading: kind === 'nat', side: THREE.DoubleSide });
+          wallMats.set(key, mat);
+          return mat;
+        };
+        for (const [kind, geo] of Object.entries(T.cutWalls || {})) {
+          if (!geo) continue;
+          for (const part of geo.parts && geo.parts.length ? geo.parts : [geo]) {
+            if (!part.indices || !part.indices.length) continue;
+            // lisas: cara interior, tapa y cara exterior, cada una con su textura
+            const subs = part.sub ? Object.entries(part.sub).filter(([, ix]) => ix.length) : [['face', part.indices]];
+            for (const [sub, ix] of subs) {
+              const cv = this.app.cutWallTexCanvas ? this.app.cutWallTexCanvas(kind, part.idx ?? null, false, sub) : null;
+              const wm = new THREE.Mesh(mkGeo({ positions: part.positions, uvs: part.uvs, indices: ix }), wallMat(kind, cv));
+              wm.userData.cutWall = kind;
+              wm.userData.cutIdx = part.idx ?? null;
+              wm.userData.cutPart = sub;
+              this.markExag(wm, (x, y, z) => z);
+              this.wallMeshes.push(wm);
+              this.extras.add(wm);
+              info.terrainTris += ix.length / 3;
+            }
+          }
+        }
+        // nivel natural del suelo a lo largo de la ruta principal (para el gráfico de perfil)
+        {
+          const r0 = L.routes[0], step = Math.max(1, Math.round(2 / r0.ds));
+          const sArr = [], zArr = [];
+          for (let i = 0; i < r0.n; i += step) { sArr.push(r0.s[i]); zArr.push(T.ctx.groundAt(r0.x[i], r0.y[i])); }
+          this.app.state.groundLine = { s: sArr, z: zArr };
+          if (this.app.onGroundLine) setTimeout(() => this.app.onGroundLine(), 0);
+        }
+        // paredes de los ríos socavados (0.78): roca (naturales) y mallas lisas por parte, cada una con su textura
+        if (T.riverWalls) {
+          const add = (geo, ix, kind, part, id) => {
+            if (!ix || !ix.length) return;
+            const cv = this.app.riverWallTexCanvas ? this.app.riverWallTexCanvas(kind, id, part) : null;
+            const wm = new THREE.Mesh(mkGeo({ positions: geo.positions, uvs: geo.uvs, indices: ix }), wallMat(kind, cv));
+            wm.userData.riverWall = kind; wm.userData.riverId = id; wm.userData.cutPart = part;
+            this.markExag(wm, (x, y, z) => z);
+            this.wallMeshes.push(wm);
+            this.extras.add(wm);
+            info.terrainTris += ix.length / 3;
+          };
+          for (const q of T.riverWalls.nat) add(q, q.indices, 'nat', 'face', q.id);
+          for (const q of T.riverWalls.art) for (const part of ['face', 'top', 'out']) add(q, q.sub[part], 'art', part, q.id);
+        }
+        info.terrainTris += (T.baseIndices || T.indices).length / 3; // lo que se dibuja (sin lo recortado), más las paredes
+        // agua (playa y montaña): un plano azul al nivel del mar
+        if (T.waterLevel != null) {
+          const b = T.bounds, mg = 400;
+          const wg = new THREE.PlaneGeometry(b.maxX - b.minX + 2 * mg, b.maxY - b.minY + 2 * mg);
+          wg.translate((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, T.waterLevel);
+          const wm = new THREE.Mesh(wg, new THREE.MeshStandardMaterial({ color: 0x2c7fc0, roughness: 0.15, metalness: 0.1, transparent: true, opacity: 0.82, depthWrite: false }));
+          wm.userData.water = true;
+          wm.renderOrder = 2;
+          this.markExag(wm, (x, y, z) => z);
+          this.waterMesh = wm;
+          this.extras.add(wm);
+        }
+        info.terrainCell = T.cell;
+        info.terrainCellFine = T.cellFine;
+      }
+      // cerros: una malla por cerro (seleccionable)
+      const HS = buildHills(L, E, sp, T, hillsW);
+      this.hillData = HS;
+      newRuns = HS.tunnels.map((t) => ({ k: t.k, e0: t.e0, e1: t.e1, s0: t.s0, s1: t.s1 }));
+      this.trigTunnels = HS.tunnels.map((t) => ({ id: t.id, k: t.k, e0: t.e0, e1: t.e1, name: `tunel_${String(t.id + 1).padStart(2, '0')}` }));
+      for (const h of HS.hills) {
+        const m = tex
+          ? new THREE.MeshStandardMaterial({ map: tex, roughness: 1, metalness: 0, color: 0xd8c8b0, side: THREE.DoubleSide })
+          : new THREE.MeshStandardMaterial({ color: 0x6f7d45, roughness: 1, metalness: 0, side: THREE.DoubleSide });
+        const mesh = new THREE.Mesh(mkGeo(h.wall ? { ...h, indices: h.baseIndices } : h), m);
+        mesh.userData.hillId = h.id;
+        if (h.wall) { // cauces socavados de las cascadas: los de cada cascada con su material (0.88)
+          const parts = h.fallWalls && h.fallWalls.length ? h.fallWalls : [{ ...h.wall, riverId: null }];
+          for (const fw of parts) {
+            const wm = new THREE.Mesh(mkGeo(fw), this.fallWallMaterial(fw.riverId));
+            wm.userData.riverWall = 'fall';
+            wm.userData.wallHill = h.id;
+            if (fw.riverId != null) wm.userData.riverId = fw.riverId;
+            this.markExag(wm, (x, y) => T.sample(x, y));
+            this.wallMeshes.push(wm);
+            this.extras.add(wm);
+          }
+        }
+        this.markExag(mesh, (x, y) => T.sample(x, y)); // el cerro se apoya en el terreno exagerado sin estirarse
+        this.hillMeshes.push(mesh);
+        this.extras.add(mesh);
+        info.hills.push({ id: h.id, name: h.name, tris: h.tris, cell: h.cell });
+        this.objTris.hills.set(h.id, { name: h.name, tris: h.tris });
+        info.hillTris += h.tris;
+      }
+      this.setHillSelection(this.app.state.selHill, false);
+      // ríos (sobre el terreno) y cascadas (sobre su cerro): mallas de agua con materiales distintos
+      if (riversW && riversW.length) {
+        const RW = buildRivers(T, HS, riversW, sp);
+        this.waterSampler = waterSurfaceSampler(RW, T, (x, y) => (this.groundCache ? this.groundCache.sample(x, y) : T.sample(x, y))); // (antes de exagerar: copia las posiciones)
+        const riverMat = new THREE.MeshStandardMaterial({ color: 0x2f86d6, roughness: 0.12, metalness: 0.05, transparent: true, opacity: 0.85, depthWrite: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+        const fallMat = new THREE.MeshStandardMaterial({ color: 0xbfe8ff, emissive: 0x16323f, roughness: 0.25, metalness: 0, transparent: true, opacity: 0.9, depthWrite: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+        info.riverTris = 0;
+        const bedTex = this.texture(this.app.state.riverBedTex || null);
+        if (bedTex) { bedTex.wrapS = bedTex.wrapT = THREE.RepeatWrapping; bedTex.needsUpdate = true; }
+        const bedMat = new THREE.MeshStandardMaterial({ map: bedTex, color: bedTex ? 0xffffff : 0x6b5a45, roughness: 1, metalness: 0 });
+        for (const w of RW) {
+          if (w.bed) { // lecho: plano simple bajo el agua
+            const bm = new THREE.Mesh(mkGeo(w.bed), bedMat.clone()); // propio (para resaltarlo)
+            { const own = this.app.riverOwnTex ? this.app.riverOwnTex(w.id, 'bed') : null; if (own) { const bt = this.texture(own); bt.wrapS = bt.wrapT = THREE.RepeatWrapping; bm.material.map = bt; bm.material.color.set(0xffffff); } } // textura del lecho de este río
+            bm.userData.riverId = w.id; bm.userData.riverBed = true; bm.name = w.bed.name;
+            this.markExag(bm, (x, y, z) => z);
+            this.riverMeshes.push(bm);
+            this.extras.add(bm);
+            info.riverTris += w.bed.tris;
+          }
+          // 0.83: textura del agua (propia del río o la general de su tipo: río, lago o cascada) y segunda capa
+          const wmat = (layer) => {
+            const cv = this.app.waterTexCanvas ? this.app.waterTexCanvas(w.cat, w.id, layer) : null, t = this.texture(cv);
+            if (t) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.needsUpdate = true; }
+            const mt = (w.kind === 'fall' ? fallMat : riverMat).clone();
+            if (t) { mt.map = t; mt.color.set(0xffffff); }
+            if (layer === 2) { mt.opacity = 1; mt.polygonOffsetFactor = -4; mt.polygonOffsetUnits = -4; }
+            return mt;
+          };
+          for (const [geo, layer] of [[w, 1], ...(w.layer2 ? [[w.layer2, 2]] : [])]) {
+            const m = new THREE.Mesh(mkGeo(geo), wmat(layer)); // material propio (para resaltarlo)
+            m.userData.riverId = w.id; m.userData.waterLayer = layer;
+            m.name = layer === 2 ? w.layer2.name : w.name;
+            m.renderOrder = layer === 2 ? 4 : 3;
+            if (w.kind === 'fall') this.markExag(m, (x, y) => T.sample(x, y)); else this.markExag(m, (x, y, z) => z);
+            this.riverMeshes.push(m);
+            this.extras.add(m);
+            info.riverTris += geo.tris;
+          }
+        }
+        this.riverData = RW;
+        if (this.app.onRiversInfo) this.app.onRiversInfo(RW);
+        this.setRiverSelection(this.app.state.selRiver, false);
+      }
+      // túneles: paredes, techo, veredas y bocas como mallas separadas
+      if (HS.tunnelGeo.length) {
+        // materiales según el tipo propio de cada túnel (artificial o natural)
+        const matsFor = (natural) => [
+          natural ? new THREE.MeshStandardMaterial({ color: 0x6f6259, roughness: 1, flatShading: true, side: THREE.DoubleSide }) : new THREE.MeshStandardMaterial({ color: 0x9a9da3, roughness: 0.9, side: THREE.DoubleSide }),
+          natural ? new THREE.MeshStandardMaterial({ color: 0x5d5249, roughness: 1, flatShading: true, side: THREE.DoubleSide }) : new THREE.MeshStandardMaterial({ color: 0x7e8288, roughness: 0.9, side: THREE.DoubleSide }),
+          new THREE.MeshStandardMaterial({ color: natural ? 0x857566 : 0xb9bcc2, roughness: 0.85, side: THREE.DoubleSide, flatShading: natural }),
+        ];
+        const walkMat = new THREE.MeshStandardMaterial({ color: 0x8a8a84, roughness: 0.95, side: THREE.DoubleSide });
+        const rockMat = new THREE.MeshStandardMaterial({ color: 0x5c5049, roughness: 1, flatShading: true, side: THREE.DoubleSide });
+        const pillarMat = new THREE.MeshStandardMaterial({ color: 0x8d9097, roughness: 0.85 });
+        const roadZ = this.roadBaseFn(L, E);
+        const tile = Math.max(0.5, sp.tunnelTexTile ?? 6);
+        const texFor = (uid, kind) => {
+          const cv = this.app.tunnelTexCanvas ? this.app.tunnelTexCanvas(uid, kind) : null;
+          const tx = this.texture(cv);
+          if (tx) { tx.repeat.set(6 / tile, 6 / tile); tx.needsUpdate = true; } // UV del túnel en unidades de 6 m
+          return tx;
+        };
+        const torch = torchGeometry();
+        const torchGeo = { wood: mkGeo({ positions: new Float32Array(torch.wood.positions), indices: torch.wood.indices }), flame: mkGeo({ positions: new Float32Array(torch.flame.positions), indices: torch.flame.indices }) };
+        const torchWood = new THREE.MeshStandardMaterial({ color: 0x4a3526, roughness: 0.9 });
+        const torchFlame = new THREE.MeshBasicMaterial({ color: 0xffa22e, side: THREE.DoubleSide });
+        for (const t of HS.tunnelGeo) {
+          // materiales propios por túnel (para resaltarlo al seleccionarlo)
+          const [wallMat, ceilMat, portalMat] = matsFor(!!t.natural);
+          const mats = [wallMat, ceilMat, walkMat, portalMat, rockMat, pillarMat].map((m) => m.clone());
+          const [wm, cm, km, pm0, rm, plm] = mats;
+          // texturas de paredes y techo (propias del túnel o generales); las veredas usan la de las paredes
+          const twx = texFor(t.texUid, 'wall'), tcx = texFor(t.texUid, 'ceil');
+          if (twx) { wm.map = twx; wm.color.set(0xffffff); km.map = twx; km.color.set(0xffffff); }
+          if (tcx) { cm.map = tcx; cm.color.set(0xffffff); }
+          const addT = (geo, mat) => {
+            const n = add(geo, mat);
+            if (n) { const m = this.extras.children[this.extras.children.length - 1]; m.userData.tunnelId = t.id; this.tunnelMeshes.push(m); this.markExag(m, (x, y) => roadZ(x, y)); }
+            return n;
+          };
+          let tris = addT(t.walls, wm) + addT(t.ceiling, cm) + addT(t.walkways, km);
+          this.tunnelGeoById.set(t.id, t);
+          this.roadZFn = roadZ;
+          if (t.singleMesh === false && t.natural) {
+            // cada roca y estalactita como objeto propio (pivote en el piso / en su base): se seleccionan y se mueven
+            for (const it of [...t.stalItems, ...t.rockItems]) {
+              const cmh = new THREE.Mesh(mkGeo({ positions: new Float32Array(it.positions), indices: it.indices }), rm.clone());
+              cmh.position.set(it.x, it.y, it.z);
+              cmh.userData = { tunnelId: t.id, cave: { tid: t.id, kind: it.kind, key: it.key }, exagObj: { z: it.z, shift: roadZ(it.x, it.y) } };
+              cmh.name = `${t.name}_${it.kind === 'r' ? 'roca' : 'estalactita'}_${it.key}`;
+              this.tunnelMeshes.push(cmh);
+              this.caveMeshes.push(cmh);
+              this.extras.add(cmh);
+              tris += it.indices.length / 3;
+            }
+          } else tris += addT(t.stalactites, rm) + addT(t.rocks, rm);
+          for (const pt of t.portals) tris += addT(pt.geo, pm0);
+          // decoración de pared: antorcha por defecto o un modelo de la biblioteca, con el pivote en la pared
+          if (t.wallDeco && t.wallDeco.length) {
+            const D = t.deco || {};
+            const A = D.model != null ? (this.app.state.assets || []).find((a) => a.id == D.model) : null; // eslint-disable-line eqeqeq
+            const rot = ((D.rot || 0) * Math.PI) / 180, sc0 = D.scale || 1;
+            for (const w of t.wallDeco) {
+              const g = new THREE.Group();
+              if (A) for (const part of A.parts) { const m = new THREE.Mesh(part.geometry, part.material); part.matrix.decompose(m.position, m.quaternion, m.scale); g.add(m); tris += (part.geometry.index ? part.geometry.index.count : part.geometry.getAttribute('position').count) / 3; }
+              else { g.add(new THREE.Mesh(torchGeo.wood, torchWood), new THREE.Mesh(torchGeo.flame, torchFlame)); tris += (torch.wood.indices.length + torch.flame.indices.length) / 3; }
+              g.position.set(w.x, w.y, w.z);
+              g.rotation.z = w.yaw + rot;
+              g.scale.setScalar(sc0);
+              g.userData = { tunnelId: t.id, wallDeco: true, exagObj: { z: w.z, shift: roadZ(w.x, w.y) } };
+              g.traverse((o) => { if (o.isMesh) { o.userData.tunnelId = t.id; this.tunnelDecoMeshes.push(o); } });
+              this.extras.add(g);
+            }
+          }
+          if (t.shell) tris += addT(t.shell, pm0); // sin cerro: cáscara exterior (material de la boca)
+          for (const pl of t.pillars) {
+            const pm = new THREE.Mesh(mkGeo(pillarGeometry(pl)), plm);
+            pm.userData.tunnelId = t.id;
+            pm.userData.exagObj = { z: pl.z, shift: roadZ(pl.x, pl.y) };
+            this.tunnelMeshes.push(pm);
+            pm.position.set(pl.x, pl.y, pl.z);
+            this.extras.add(pm);
+            tris += 12;
+          }
+          info.tunnelTris += tris;
+          info.tunnels.push({ id: t.id, name: t.name, len: t.len, s0: t.sMid - t.len / 2, s1: t.sMid + t.len / 2, stal: t.stalOn, pillars: t.pillars.length, tris, k: t.k, sMid: t.sMid, openMode: t.openMode, pillarCount: t.pillarCount, custom: t.custom, key: t.key, shape: t.shape, type: t.type, density: t.density, meshMode: t.meshMode, maxTris: t.maxTris, adapt: t.adapt, rocks: t.rocksOn, rockDensity: t.rockDensity, stalDensity: t.stalDensity, singleMesh: t.singleMesh, sections: t.sections, profilePts: t.profilePts, width: t.width, height: t.height, caveSize: t.caveSize, portalFrame: t.portalFrame, portalDepth: t.portalDepth, noHill: t.noHill, hillIds: t.hillIds || [], texUid: t.texUid, deco: t.deco, decoPlaced: (t.wallDeco || []).length });
+          this.objTris.tunnels.set(t.id, { name: t.name, tris });
+        }
+        if (this.app.state.selCave) this.setCaveSelection(true); // la roca o estalactita seleccionada sigue resaltada y con su gizmo
+      }
+    }
+    // pórtico de salida
+    if (sp.startGate) {
+      const G = buildStartGate(L, E, sp);
+      const grp = new THREE.Group();
+      grp.position.set(...G.origin);
+      const bKey = G.text;
+      if (!this.bannerCanvas || this.bannerCanvas.text !== bKey) { this.bannerCanvas = makeBannerCanvas(bKey); this.bannerCanvas.text = bKey; }
+      if (!this.checkerCanvas) this.checkerCanvas = makeCheckerCanvas();
+      const bt = this.texture(this.bannerCanvas);
+      add(G.frame, new THREE.MeshStandardMaterial({ color: 0x30343c, roughness: 0.6, metalness: 0.3 }), grp);
+      add(G.banner, new THREE.MeshStandardMaterial({ map: bt, roughness: 0.7 }), grp);
+      add(G.line, new THREE.MeshStandardMaterial({ map: this.texture(this.checkerCanvas), roughness: 0.8, polygonOffset: true, polygonOffsetFactor: -2 }), grp);
+      grp.userData.exagObj = { z: G.origin[2], shift: G.origin[2] };
+      this.extras.add(grp);
+      info.gateTris = G.tris;
+    }
+    const ground = makeGround(this.terrainData, this.hillData);
+    if (ground) ground.waterAt = this.waterSampler || waterSurfaceSampler([], this.terrainData, (x, y) => ground.sample(x, y)); // adornos sobre el agua
+    this.groundCache = ground;
+    this.buildSignMeshes(ground, info); // señalética de curvas
+    if (this.paintMode) this.refreshPaintOverlay();
+    this.vegModels = { trees: null, grass: null };
+    const hasAsset = (id) => !!(this.app.assetById && this.app.assetById(id));
+    this.buildGrassMesh(info); // hierba (una malla por grupo o modelos)
+    this.buildTreeMesh(info); // árboles (conos combinados o modelos)
+    this.buildTriggerMeshes(); // triggers de las bocas (ya se conocen los túneles)
+    this.buildShadowMesh(info);
+    // los bordes se cortan en los túneles: si cambiaron, se rehacen
+    if (JSON.stringify(newRuns) !== JSON.stringify(this.tunnelRuns)) { this.tunnelRuns = newRuns; this.pendingUpdate = true; setTimeout(() => { this.pendingUpdate = false; this.update(false, true); }, 0); } // pista (material de los tramos en túnel) y bordes
+    this.applyExag(); // también rehace la decoración (sets y modelos de vegetación)
+    info.ms = performance.now() - t0;
+    if (this.grid) this.grid.visible = !sp.terrain;
+    this.buildPillars();
+    this.needsFrame = true;
+    this.triCounts.terrain = info.terrainTris;
+    this.triCounts.tunnels = info.tunnelTris || 0;
+    this.triCounts.hills = info.hillTris || 0;
+    this.triCounts.rivers = info.riverTris || 0;
+    this.triCounts.gate = info.gateTris || 0;
+    this.triCounts.trees = info.treeTris || 0;
+    this.triCounts.grass = info.grassTris || 0;
+    this.updateStats();
+    this.applyWireframe();
+    if (this.game && this.game.active) this.game.onSceneRebuilt();
+    if (this.app.onSceneInfo) this.app.onSceneInfo(info);
+  }
+
+  /** Señalética de curvas: por tipo, los carteles (textura propia o de fábrica, recortada por su transparencia) y los postes. */
+  buildSignMeshes(ground, info) {
+    if (this.signGroup) { this.extras.remove(this.signGroup); this.signGroup.traverse((o) => { if (o.geometry) o.geometry.dispose(); }); this.signGroup = null; }
+    this.signData = null;
+    const L = this.app.state.layout, E = this.app.state.result, sp = this.app.state.scene;
+    if (!L || !E || !sp.signs) { this.triCounts.signs = 0; if (this.app.onSignsInfo) setTimeout(() => this.app.onSignsInfo(null), 0); return; }
+    const tun = this.hillData ? this.hillData.tunnels.map((t) => ({ k: t.k, s0: t.sMid - t.len / 2, s1: t.sMid + t.len / 2 })) : [];
+    const SG = buildSigns(L, E, sp, ground, tun);
+    this.signData = SG;
+    const grp = new THREE.Group();
+    grp.userData.signs = true;
+    const mat = (cv) => { const t = this.texture(cv); return new THREE.MeshStandardMaterial({ map: t, alphaTest: 0.5, side: THREE.FrontSide, roughness: 0.7, metalness: 0 }); }; // de una cara: por detrás va la copia (salvo One sided)
+    const postMat = mat(this.app.signTexCanvas('post'));
+    for (const [type, M] of Object.entries(SG.byType)) {
+      const add = (geo, m, part) => {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.BufferAttribute(geo.positions, 3));
+        g.setAttribute('uv', new THREE.BufferAttribute(geo.uvs, 2));
+        g.setIndex(new THREE.BufferAttribute(geo.indices, 1));
+        g.computeVertexNormals();
+        const mesh = new THREE.Mesh(g, m);
+        mesh.userData.sign = type; mesh.userData.signPart = part;
+        // cada cartel sube o baja con el suelo exagerado, sin estirarse (4 vértices por plano)
+        const pos = g.getAttribute('position'), list = SG.signs.filter((q) => q.type === type);
+        mesh.userData.exag = { base: new Float32Array(pos.array), shift: Float32Array.from({ length: pos.count }, (_, v) => list[Math.floor(v / M.vps)].z) };
+        mesh.userData.signTris = M.vps / 2; // triángulos por cartel (clic: faceIndex / esto = el cartel)
+        grp.add(mesh);
+      };
+      add(M.sign, mat(this.app.signTexCanvas(type)), 'sign');
+      add(M.post, postMat, 'post');
+    }
+    this.extras.add(grp);
+    this.signGroup = grp;
+    this.triCounts.signs = SG.tris;
+    if (info) info.signs = SG.signs.length;
+    if (this.app.onSignsInfo) setTimeout(() => this.app.onSignsInfo(SG), 0);
+  }
+
+  /**
+   * Hierba: una malla por grupo (planos cruzados, 4 triángulos por mata) o modelos (instancias en la decoración).
+   * El grupo activo sin «single mesh» se edita mata a mata. Se llama desde buildExtras o sola (info = null) al editar.
+   */
+  buildGrassMesh(info = null) {
+    for (const m of this.grassMeshes || []) { this.extras.remove(m); m.geometry.dispose(); m.material.dispose(); }
+    this.grassMeshes = []; this.grassMesh = null; this.grassData = null;
+    if (!this.vegModels) this.vegModels = { trees: null, grass: null };
+    this.vegModels.grass = [];
+    const own = !info;
+    if (own) info = {};
+    const L = this.app.state.layout, E = this.app.state.result, sp = this.app.state.scene;
+    const ground = this.groundCache || null;
+    const hasAsset = (id) => !!(this.app.assetById && this.app.assetById(id));
+    const sel = sp.grassGroupSel | 0;
+    const groups = L && E ? buildGrassGroups(L, E, sp, ground) : [];
+    if (groups.length) { info.grass = 0; info.grassTris = 0; }
+    for (const { g: gi, sp: gsp, GR } of groups) {
+      const active = gi === sel, edit = active && gsp.grassSingle === false;
+      if (active) this.grassData = GR.insts;
+      const gItems = grassModelItems(GR.insts, gsp.grassAssets, hasAsset); // hierba reemplazada por modelos
+      if (gItems) { this.vegModels.grass.push({ g: gi, items: gItems, edit }); GR.tris = gItems.reduce((a, it) => a + (this.app.assetById(it.asset).tris || 0), 0); }
+      if (GR.count && !gItems) {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.BufferAttribute(GR.positions, 3));
+        g.setAttribute('normal', new THREE.BufferAttribute(GR.normals, 3));
+        g.setAttribute('uv', new THREE.BufferAttribute(GR.uvs, 2));
+        g.setIndex(new THREE.BufferAttribute(GR.indices, 1));
+        const ownTex = this.app.vegTexCanvas ? this.app.vegTexCanvas('grass', gsp.vegGroupId) : this.app.state.grassTex; // textura del grupo
+        if (!ownTex && !this.defaultGrass) this.defaultGrass = makeGrassCanvas();
+        const gm = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ map: this.texture(ownTex || this.defaultGrass), alphaTest: 0.5, side: THREE.DoubleSide, roughness: 1, metalness: 0 }));
+        { // cada mata sube o baja con el suelo exagerado, sin estirarse (8 vértices por mata)
+          const T0 = this.terrainData, sh = GR.insts.map((t) => (T0 ? T0.sample(t.x, t.y) : t.z));
+          const pos = g.getAttribute('position');
+          gm.userData.exag = { base: new Float32Array(pos.array), shift: Float32Array.from({ length: pos.count }, (_, v) => sh[Math.floor(v / 8)]) };
+          const k = this.zExag - 1, a = pos.array, ex = gm.userData.exag;
+          for (let v = 0; v < pos.count; v++) a[v * 3 + 2] = ex.base[v * 3 + 2] + ex.shift[v] * k;
+          g.computeBoundingSphere();
+        }
+        gm.userData.noWire = true;
+        gm.userData.veg = 'grass';
+        gm.userData.vegGroup = gi;
+        if (edit) gm.userData.vegEdit = { kind: 'grass' }; // sin «single mesh»: cada mata se elige (faceIndex / 4)
+        if (active) this.grassMesh = gm;
+        this.extras.add(gm);
+        this.grassMeshes.push(gm);
+      }
+      info.grass += GR.count;
+      info.grassTris += GR.tris;
+      if (active) info.grassActive = GR.count;
+    }
+    if (own) {
+      this.triCounts.grass = info.grassTris || 0;
+      this.buildDeco(false);
+      this.applyWireframe();
+      if (this.app.onGrassInfo) this.app.onGrassInfo(info);
+      this.updateHandles();
+      this.updateStats();
+      this.needsFrame = true;
+    }
+    return info;
+  }
+
+  /**
+   * Árboles: conos en una malla combinada (16 triángulos por árbol) o modelos (instancias en la decoración).
+   * Se llama desde buildExtras o sola (info = null) al editar los árboles a mano, sin reconstruir el terreno.
+   */
+  buildTreeMesh(info = null) {
+    if (this.treeMesh) { this.extras.remove(this.treeMesh); this.treeMesh.geometry.dispose(); this.treeMesh.material.dispose(); this.treeMesh = null; }
+    for (const m of this.treeMeshesOther || []) { this.extras.remove(m); m.geometry.dispose(); m.material.dispose(); }
+    this.treeMeshesOther = [];
+    this.treeData = null;
+    if (!this.vegModels) this.vegModels = { trees: null, grass: null };
+    this.vegModels.trees = null; this.vegModels.treesOther = [];
+    const own = !info;
+    if (own) info = {};
+    const L = this.app.state.layout, E = this.app.state.result, sp = this.app.state.scene;
+    const ground = this.groundCache || null;
+    const hasAsset = (id) => !!(this.app.assetById && this.app.assetById(id));
+    let shadowTrees = null;
+    const sel = sp.treeGroupSel | 0;
+    // conos de un grupo en una malla combinada; cada árbol (10 vértices) se desplaza con el suelo exagerado, sin estirarse
+    const coneMesh = (TR, texCv) => {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(TR.positions, 3));
+      g.setAttribute('uv', new THREE.BufferAttribute(TR.uvs, 2));
+      g.setIndex(new THREE.BufferAttribute(TR.indices, 1));
+      const tm = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: texCv ? 0xffffff : 0x2e6b34, map: texCv ? this.texture(texCv) : null, roughness: 0.9, flatShading: true }));
+      const T0 = this.terrainData, per = TR.trees.map((t) => (T0 ? T0.sample(t.x, t.y) : t.z));
+      const pos = g.getAttribute('position');
+      tm.userData.exag = { base: new Float32Array(pos.array), shift: Float32Array.from({ length: pos.count }, (_, v) => per[Math.floor(v / 10)]) };
+      const k = this.zExag - 1, a = pos.array, ex = tm.userData.exag;
+      for (let v = 0; v < pos.count; v++) a[v * 3 + 2] = ex.base[v * 3 + 2] + ex.shift[v] * k;
+      g.computeVertexNormals();
+      g.computeBoundingSphere();
+      tm.userData.veg = 'trees';
+      return tm;
+    };
+    if (L && E) {
+      const groups = buildTreeGroups(L, E, sp, ground);
+      if (groups.length) { shadowTrees = []; info.trees = 0; info.treeTris = 0; info.treesOnHills = 0; }
+      for (const { g, sp: gsp, TR } of groups) {
+        shadowTrees.push(...TR.trees);
+        const active = g === sel;
+        const tItems = treeModelItems(TR.trees, gsp.treeAssets, hasAsset); // árboles reemplazados por modelos
+        if (active) { this.treeData = TR.trees; if (tItems) this.vegModels.trees = tItems; } else if (tItems) this.vegModels.treesOther.push({ g, items: tItems });
+        if (TR.count && !tItems) {
+          const tm = coneMesh(TR, this.app.vegTexCanvas ? this.app.vegTexCanvas('tree', gsp.vegGroupId) : null); // textura propia del grupo (o verde liso)
+          if (active) {
+            if (gsp.treeSingle === false) tm.userData.vegEdit = { kind: 'tree' }; // sin «single mesh»: cada árbol se elige (faceIndex / 16)
+            this.treeMesh = tm;
+          } else { tm.userData.vegGroup = g; this.treeMeshesOther.push(tm); } // otro grupo: un clic lo trae al panel
+          this.extras.add(tm);
+        }
+        info.trees += TR.count;
+        info.treeTris += tItems ? tItems.reduce((a, it) => a + (this.app.assetById(it.asset).tris || 0), 0) : TR.indices.length / 3;
+        info.treesOnHills += TR.trees.filter((t) => t.where !== 'terrain').length;
+        if (active) { info.treesActive = TR.count; info.treesActiveOnHills = TR.trees.filter((t) => t.where !== 'terrain').length; }
+      }
+    }
+    this.shadowTrees = shadowTrees;
+    if (own) {
+      this.triCounts.trees = info.treeTris || 0;
+      this.buildDeco(false);
+      this.buildShadowMesh();
+      this.applyWireframe();
+      if (this.app.onTreesInfo) this.app.onTreesInfo(info);
+      this.updateHandles();
+      this.needsFrame = true;
+    }
+    return info;
+  }
+
+  /** Árbol o adorno seleccionado ({kind: 'tree' | 'deco', set, i}): sus datos y dónde se dibuja. */
+  vegItem(v) {
+    if (!v) return null;
+    if (v.kind === 'tree') {
+      const t = this.treeData && this.treeData[v.i];
+      if (!t) return null;
+      return { x: t.x, y: t.y, z: t.z, r: Math.max(0.6, t.r * 1.25), t };
+    }
+    if (v.kind === 'grass') {
+      const t = this.grassData && this.grassData[v.i];
+      if (!t) return null;
+      return { x: t.x, y: t.y, z: t.z, r: Math.max(0.4, t.w * 0.6), t };
+    }
+    const it = ((this.decoItemsBySet || {})[v.set] || []).find((q) => q.bi === v.i);
+    if (!it) return null;
+    const A = this.app.assetById ? (this.app.assetById(it.asset) || null) : null;
+    const size = A && A.size ? Math.max(A.size[0] * (it.sx ?? 1), A.size[1] * (it.sy ?? 1)) : 1;
+    return { x: it.x, y: it.y, z: it.z, r: Math.max(0.5, size * (it.scale || 1) * 0.75), it };
+  }
+
+  /** Altura (con la exageración Z) del suelo bajo un árbol o adorno. */
+  vegZ(x, y, z) {
+    const T0 = this.terrainData, t = T0 ? T0.sample(x, y) : z;
+    return z + (Number.isFinite(t) ? t : z) * (this.zExag - 1);
+  }
+
+  /** Mueve en vivo (sin reconstruir) un árbol o adorno a (x, y), apoyado en el suelo. Devuelve {x, y}. */
+  moveVegLive(v, x, y) {
+    const vi = this.vegItem(v);
+    if (!vi) return null;
+    const sp = this.app.state.scene, ground = this.groundCache || null;
+    const setInst = (pred, fn) => { // actualiza la matriz de las instancias que cumplen pred
+      if (!this.decoGroup) return;
+      const tmp = new THREE.Matrix4();
+      this.decoGroup.traverse((o) => {
+        if (!o.isInstancedMesh || !o.userData.instItems) return;
+        const list = o.userData.instItems;
+        for (let j = 0; j < list.length; j++) {
+          if (!pred(o, list[j])) continue;
+          const it = fn(list[j], j, list);
+          tmp.multiplyMatrices(instanceMatrix(it, it.scale, it.wat === 1 ? it.z * this.zExag + 0.25 : this.vegZ(it.x, it.y, it.z)), o.userData.partMatrix || new THREE.Matrix4());
+          o.setMatrixAt(j, tmp);
+          o.instanceMatrix.needsUpdate = true;
+          o.computeBoundingSphere();
+        }
+      });
+    };
+    if (v.kind === 'tree') {
+      const nt = moveTree(vi.t, ground, x, y, sp.treeTilt, vi.t.z);
+      Object.assign(nt, { g: vi.t.g, sh: vi.t.sh, shm: vi.t.shm });
+      if (this.shadowTrees) { const j = this.shadowTrees.indexOf(vi.t); if (j >= 0) this.shadowTrees[j] = nt; }
+      this.treeData[v.i] = nt;
+      if (this.treeMesh) { // 10 vértices del cono
+        const g = this.treeMesh.geometry, a = g.getAttribute('position'), ex = this.treeMesh.userData.exag;
+        const vv = treeConeVerts(nt), T0 = this.terrainData, sh = T0 ? T0.sample(nt.x, nt.y) : nt.z, k = this.zExag - 1;
+        for (let j = 0; j < 10; j++) {
+          const o = (v.i * 10 + j) * 3;
+          ex.base[o] = vv[j * 3]; ex.base[o + 1] = vv[j * 3 + 1]; ex.base[o + 2] = vv[j * 3 + 2]; ex.shift[v.i * 10 + j] = sh;
+          a.array[o] = vv[j * 3]; a.array[o + 1] = vv[j * 3 + 1]; a.array[o + 2] = vv[j * 3 + 2] + sh * k;
+        }
+        a.needsUpdate = true;
+        g.computeVertexNormals();
+        g.computeBoundingSphere();
+      }
+      const vm = this.vegModels && this.vegModels.trees;
+      if (vm) {
+        const models = [...new Set(vm.map((q) => q.asset))];
+        setInst((o, q) => o.userData.veg === 'trees' && q.bi === v.i, (q) => Object.assign(q, treeModelItem(nt, v.i, models), { asset: q.asset }));
+      }
+    } else if (v.kind === 'grass') {
+      const nt = moveGrass(vi.t, ground, x, y, sp.grassTilt, vi.t.z + 0.03);
+      this.grassData[v.i] = nt;
+      if (this.grassMesh) { // 8 vértices de la mata
+        const g = this.grassMesh.geometry, a = g.getAttribute('position'), ex = this.grassMesh.userData.exag;
+        const vv = new Float32Array(24), T0 = this.terrainData, sh = T0 ? T0.sample(nt.x, nt.y) : nt.z, k = this.zExag - 1;
+        grassTuftVerts(nt, vv);
+        for (let j = 0; j < 8; j++) {
+          const o = (v.i * 8 + j) * 3;
+          ex.base[o] = vv[j * 3]; ex.base[o + 1] = vv[j * 3 + 1]; ex.base[o + 2] = vv[j * 3 + 2]; ex.shift[v.i * 8 + j] = sh;
+          a.array[o] = vv[j * 3]; a.array[o + 1] = vv[j * 3 + 1]; a.array[o + 2] = vv[j * 3 + 2] + sh * k;
+        }
+        a.needsUpdate = true;
+        g.computeBoundingSphere();
+      }
+      setInst((o, q) => o.userData.veg === 'grass' && o.userData.vegEdit && q.bi === v.i, (q) => Object.assign(q, { x: nt.x, y: nt.y, z: nt.z, up: nt.up }));
+    } else {
+      const set = (this.app.state.decoSets || []).find((q) => q.id === v.set);
+      const st0 = this.app.state, P = set ? decoPlace(st0.layout, st0.result, sp, ground, set, x, y, vi.it.z, vi.it.z) : vegPlace(ground, x, y, 0, vi.it.z); // (sobre la pista si el set va ahí)
+      setInst((o, q) => o.userData.decoSet === v.set && q.bi === v.i, (q) => Object.assign(q, { x: P.x, y: P.y, z: P.z, up: P.up, wat: P.wat || 0 }));
+    }
+    if (this.vegRing) { const w = this.vegItem(v); if (w) this.vegRing.position.set(w.x, w.y, this.vegZ(w.x, w.y, w.z) + 0.15); }
+    this.needsFrame = true;
+    return { x, y };
+  }
+
+  /** Triggers (bocas de túneles y propios): cajas semitransparentes con aristas; el seleccionado en amarillo. */
+  buildTriggerMeshes() {
+    this.disposeGroup(this.triggerGroup);
+    this.triggerGroup.scale.set(1, 1, this.zExag);
+    const st = this.app.state, L = st.layout, E = st.result, sp = st.scene;
+    this.triggerData = [];
+    if (!L || !E) return;
+    const TR = buildTriggers(L, E, sp, this.app.triggersWorld ? this.app.triggersWorld() : [], this.trigTunnels || []);
+    this.triggerData = TR;
+    this.nodeData = buildNodes(L, E, sp);
+    this.buildNodeMeshes();
+    if (sp.showTriggers === false) { this.needsFrame = true; return; }
+    const Mx = new THREE.Matrix4();
+    for (const t of TR) {
+      const sel = t.kind === 'custom' && st.selTrigger != null && t.custom === st.selTrigger;
+      const col = sel ? 0xffe066 : t.kind === 'custom' ? 0x3fd7ff : 0xff9f40;
+      const g = new THREE.BoxGeometry(t.d, t.w, t.h).translate(0, 0, t.h / 2);
+      const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: sel ? 0.3 : 0.16, depthWrite: false }));
+      const ed = new THREE.LineSegments(new THREE.EdgesGeometry(g), new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.85 }));
+      m.add(ed);
+      m.position.set(t.center[0], t.center[1], t.center[2]);
+      Mx.makeBasis(new THREE.Vector3(...t.T).normalize(), new THREE.Vector3(...t.L).normalize(), new THREE.Vector3(...t.U).normalize());
+      m.quaternion.setFromRotationMatrix(Mx);
+      m.scale.set(1, 1, 1 / this.zExag); // el grupo se estira con la exageración: el cubo conserva su alto real
+      m.userData = { trigger: t.kind, triggerId: t.custom ?? null, noWire: true };
+      m.renderOrder = 4;
+      this.triggerGroup.add(m);
+    }
+    this.needsFrame = true;
+  }
+
+  /** Nodos: cubos pequeños (magenta) sobre el spline, con su rotación; su propia casilla en la barra de la vista 3D. */
+  buildNodeMeshes() {
+    if (!this.nodeGroup) { this.nodeGroup = new THREE.Group(); this.scene.add(this.nodeGroup); }
+    this.disposeGroup(this.nodeGroup);
+    this.nodeGroup.scale.set(1, 1, this.zExag);
+    const sp = this.app.state.scene;
+    this.nodeGroup.visible = sp.showNodes !== false && !(this.game && this.game.active);
+    const Mx = new THREE.Matrix4();
+    for (const n of this.nodeData || []) {
+      const g = new THREE.BoxGeometry(n.size, n.size, n.size);
+      const col = 0xff40c0;
+      const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.35, depthWrite: false }));
+      m.add(new THREE.LineSegments(new THREE.EdgesGeometry(g), new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.95 })));
+      m.position.set(n.center[0], n.center[1], n.center[2]);
+      Mx.makeBasis(new THREE.Vector3(...n.T), new THREE.Vector3(...n.L), new THREE.Vector3(...n.U));
+      m.quaternion.setFromRotationMatrix(Mx);
+      m.scale.set(1, 1, 1 / this.zExag);
+      m.userData = { node: n.i, noWire: true };
+      m.renderOrder = 4;
+      this.nodeGroup.add(m);
+    }
+    this.needsFrame = true;
+  }
+
+  /** Altura de la calzada más cercana (para apoyar túneles en la pista exagerada). */
+  roadBaseFn(L, E) {
+    const pts = [];
+    L.routes.forEach((r, k) => { for (let i = 0; i < r.n; i += 2) pts.push([r.x[i], r.y[i], E.routes[k].z[i]]); });
+    const cell = 12, grid = new Map();
+    for (const p of pts) { const key = `${Math.floor(p[0] / cell)},${Math.floor(p[1] / cell)}`; let l = grid.get(key); if (!l) grid.set(key, (l = [])); l.push(p); }
+    return (x, y) => {
+      const ix = Math.floor(x / cell), iy = Math.floor(y / cell);
+      let best = null, bd = Infinity;
+      for (let r = 1; r <= 4 && !best; r++) {
+        for (let dx = -r; dx <= r; dx++) for (let dy = -r; dy <= r; dy++) {
+          const l = grid.get(`${ix + dx},${iy + dy}`);
+          if (!l) continue;
+          for (const p of l) { const d = (p[0] - x) ** 2 + (p[1] - y) ** 2; if (d < bd) { bd = d; best = p; } }
+        }
+      }
+      return best ? best[2] : 0;
+    };
+  }
+
+  /** Resalta el río o la cascada seleccionados (sin reconstruir). */
+  setRiverSelection(id, frame = true) {
+    for (const m of this.riverMeshes || []) {
+      const sel = id != null && m.userData.riverId === id;
+      if (m.userData.baseEmissive === undefined) m.userData.baseEmissive = m.material.emissive.getHex();
+      m.material.emissive.set(sel ? 0x6b5210 : m.userData.baseEmissive);
+      m.material.emissiveIntensity = sel ? 0.45 : 1;
+    }
+    if (frame) this.needsFrame = true;
+  }
+
+  /** Resalta la roca o estalactita seleccionada (amarillo) y pone el gizmo XY sobre ella. */
+  setCaveSelection(frame = true) {
+    const c = this.app.state.selCave;
+    for (const m of this.caveMeshes || []) {
+      const u = m.userData.cave, on = !!c && u.tid === c.tid && u.kind === c.kind && u.key === c.key;
+      if (on) { m.material.emissive.set(0xffd54f); m.material.emissiveIntensity = 0.8; m.renderOrder = 12; m.material.depthTest = false; m.material.transparent = true; m.material.opacity = 0.95; }
+      else if (m.material.depthTest === false) { m.material.depthTest = true; m.material.transparent = false; m.material.opacity = 1; m.renderOrder = 0; }
+    }
+    if (frame) { this.updateHandles(); this.needsFrame = true; }
+  }
+
+  /** Malla y datos de una roca o estalactita suelta. */
+  caveItem(c) {
+    if (!c) return null;
+    const t = this.tunnelGeoById && this.tunnelGeoById.get(c.tid);
+    if (!t) return null;
+    const it = (c.kind === 'r' ? t.rockItems : t.stalItems).find((q) => q.key === c.key);
+    const mesh = (this.caveMeshes || []).find((m) => m.userData.cave.tid === c.tid && m.userData.cave.kind === c.kind && m.userData.cave.key === c.key);
+    return it ? { t, it, mesh } : null;
+  }
+
+  /** Mueve en vivo (sin reconstruir) una roca o estalactita a (x, y): sobre el piso o pegada al techo. */
+  moveCaveLive(c, x, y) {
+    const ci = this.caveItem(c);
+    if (!ci) return null;
+    const P = ci.t.caveSnap(ci.it, x, y);
+    if (ci.mesh) {
+      const shift = this.roadZFn ? this.roadZFn(P.x, P.y) : 0;
+      ci.mesh.userData.exagObj = { z: P.z, shift };
+      ci.mesh.position.set(P.x, P.y, P.z + shift * (this.zExag - 1));
+      if (P.positions) { // estalactita: su largo se ajusta al espacio bajo el techo
+        const g = ci.mesh.geometry, a = g.getAttribute('position');
+        if (a.count * 3 === P.positions.length) { a.array.set(P.positions); a.needsUpdate = true; g.computeVertexNormals(); g.computeBoundingSphere(); }
+      }
+    }
+    this.needsFrame = true;
+    return P;
+  }
+
+  /** Resalta el cerro seleccionado (sin reconstruir). */
+  setHillSelection(id, frame = true) {
+    const st = this.app.state;
+    const glow = (m, sel) => { if (!m.material || !m.material.emissive) return; m.material.emissive.set(sel ? 0x6b5210 : 0x000000); m.material.emissiveIntensity = sel ? 0.45 : 0; };
+    for (const m of this.hillMeshes || []) glow(m, st.selHill != null && m.userData.hillId === st.selHill);
+    for (const m of this.tunnelMeshes || []) glow(m, st.selTunnel != null && m.userData.tunnelId === st.selTunnel);
+    this.setCaveSelection(false);
+    if (st.selCave || this.tc.object === this.proxy) this.updateHandles();
+    if (this.statsDiv) this.updateStats();
+    this.updateHillGizmo();
+    this.updateHillCtrl();
+    if (frame) this.needsFrame = true;
+  }
+
+  /** Esferas de los puntos de control del cerro seleccionado y gizmo del elegido. */
+  updateHillCtrl() {
+    if (!this.hillCtrlGroup) return;
+    this.disposeGroup(this.hillCtrlGroup);
+    const st = this.app.state, L = st.layout;
+    const h = st.selHill != null ? (st.hills || []).find((q) => q.id === st.selHill) : null;
+    const off = () => { this.hctrlTc.detach(); this.hctrlTc.enabled = false; this.hctrlDrag = null; };
+    const offLat = () => { this.latTc.detach(); this.latTc.enabled = false; if (!this.latDrag || !this.latDrag.active) this.latDrag = null; };
+    // caja de edición: esferas en cada punto y líneas entre vecinos, apoyadas en la superficie del cerro
+    const G = h && L && !(this.game && this.game.active) ? h.lattice : null;
+    if (G) {
+      const P = [];
+      for (let i = 0; i < G.nx * G.ny; i++) { const [lx, ly] = this.app.latPointL(G, i), [x, y] = L.toWorld(lx, ly); P.push(new THREE.Vector3(x, y, (this.surfaceZ(x, y) ?? 0) + 0.6)); }
+      const seg = [];
+      for (let r = 0; r < G.ny; r++) for (let c = 0; c < G.nx; c++) {
+        const k = r * G.nx + c;
+        if (c < G.nx - 1) seg.push(P[k], P[k + 1]);
+        if (r < G.ny - 1) seg.push(P[k], P[k + G.nx]);
+      }
+      const lines = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(seg), new THREE.LineBasicMaterial({ color: 0x7fd6ff, depthTest: false, transparent: true, opacity: 0.85 }));
+      lines.renderOrder = 9;
+      this.hillCtrlGroup.add(lines);
+      P.forEach((p, i) => {
+        const sel = i === st.selHillLat, v = G.dz[i] || 0;
+        const m = new THREE.Mesh(new THREE.SphereGeometry(sel ? 1.1 : 0.8, 12, 8), new THREE.MeshBasicMaterial({ color: sel ? 0xffb74d : v > 0.05 ? 0x7fd6ff : v < -0.05 ? 0x335577 : 0xbfe9ff, depthTest: false }));
+        m.renderOrder = 10;
+        m.position.copy(p);
+        m.userData = { hillLat: i };
+        this.hillCtrlGroup.add(m);
+        if (sel && (!this.latDrag || !this.latDrag.active)) {
+          this.latProxy.position.copy(p); this.latProxy.updateMatrixWorld();
+          this.latTc.attach(this.latProxy); this.latTc.enabled = true;
+          this.latDrag = { i, dz0: v, dz: v, sphere: m, active: false };
+        }
+      });
+      if (st.selHillLat == null || st.selHillLat >= P.length) offLat();
+    } else offLat();
+    if (!h || !L || (this.game && this.game.active) || !(h.ctrl && h.ctrl.length)) { off(); this.needsFrame = true; return; }
+    h.ctrl.forEach((c, i) => {
+      const [x, y] = L.toWorld(c.x, c.y), z = (this.surfaceZ(x, y) ?? 0) + 0.6;
+      const sel = i === st.selHillCtrl;
+      const m = new THREE.Mesh(new THREE.SphereGeometry(sel ? 1.3 : 1, 14, 10), new THREE.MeshBasicMaterial({ color: sel ? 0xffb74d : c.dz >= 0 ? 0xe0a050 : 0x6a8cff, depthTest: false }));
+      m.renderOrder = 10;
+      m.position.set(x, y, z);
+      m.userData = { hillCtrl: i };
+      this.hillCtrlGroup.add(m);
+      if (sel) {
+        this.hctrlProxy.position.set(x, y, z);
+        this.hctrlProxy.updateMatrixWorld();
+        if (!this.hctrlDrag || !this.hctrlDrag.active) {
+          this.hctrlTc.attach(this.hctrlProxy);
+          this.hctrlTc.enabled = true;
+          this.hctrlDrag = { i, dz0: c.dz, sphere: m, active: false };
+        }
+      }
+    });
+    if (st.selHillCtrl == null || !h.ctrl[st.selHillCtrl]) off();
+    this.needsFrame = true;
+  }
+
+  /** Flecha Z sobre la cima del cerro seleccionado: arrastrarla cambia su altura. */
+  updateHillGizmo() {
+    if (!this.hillTc) return;
+    const st = this.app.state;
+    const meshes = (this.hillMeshes || []).filter((m) => st.selHill != null && m.userData.hillId === st.selHill);
+    const hill = st.selHill != null ? (st.hills || []).find((h) => h.id === st.selHill) : null;
+    if (!meshes.length || !hill || (this.game && this.game.active) || st.tool === 'edit' || st.hillCtrlMode || st.selHillCtrl != null || st.selHillLat != null) { this.hillTc.detach(); this.hillTc.enabled = false; this.hillDrag = null; return; }
+    let best = null, zb = Infinity;
+    for (const m of meshes) {
+      const P = m.geometry.getAttribute('position');
+      for (let i = 0; i < P.count; i++) { const z = P.getZ(i); if (!best || z > best[2]) best = [P.getX(i), P.getY(i), z]; if (z < zb) zb = z; }
+    }
+    if (!best) return;
+    this.hillProxy.position.set(best[0], best[1], best[2] + 1);
+    this.hillProxy.updateMatrixWorld();
+    this.hillTc.attach(this.hillProxy);
+    this.hillTc.enabled = true;
+    this.hillDrag = { id: hill.id, h0: hill.height, newH: hill.height, meshes, zb, active: false };
+  }
+
+  /** Camino de tierra y barreras (mallas propias, seleccionables con un clic). */
+  buildEdges(stats = true) {
+    this.disposeGroup(this.edgeGroup);
+    this.edgeGroup.scale.set(1, 1, this.zExag);
+    this.triCounts.edges = 0;
+    const L = this.app.state.layout, E = this.app.state.result, sp = this.app.state.scene;
+    if (!L || !E) return;
+    const B = buildEdgeMeshes(L, E, { ...sp, coveredRanges: this.coveredCache || [] }); // también dentro de los túneles (la pared del túnel queda después)
+    const mk = (m, mat, kind) => {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
+      g.setAttribute('uv', new THREE.BufferAttribute(m.uvs, 2));
+      g.setIndex(m.indices);
+      g.computeVertexNormals();
+      const mesh = new THREE.Mesh(g, mat);
+      mesh.userData.edge = kind;
+      mesh.userData.alt = !!m.alt;
+      mesh.userData.k = m.k;
+      if (m.bridge != null) mesh.userData.bridge = m.bridge; // borde de un puente: clic abre su tarjeta
+      mesh.name = m.name;
+      this.edgeGroup.add(mesh);
+    };
+    // material por textura: la pista y los atajos sin textura propia comparten el suyo
+    const cache = new Map();
+    const matFor = (fn, m, make) => {
+      const cv = this.app[fn] ? this.app[fn](m.alt ? L.routes[m.k] : null, !!m.susp, m.bridge ?? null) : null;
+      const key = fn + ':' + (cv ? (cv.__mid || (cv.__mid = Math.random().toString(36).slice(2))) : 'none');
+      if (!cache.has(key)) cache.set(key, make(this.texture(cv)));
+      return cache.get(key);
+    };
+    const dm = (map) => new THREE.MeshStandardMaterial({ map, color: 0xffffff, roughness: 1, metalness: 0, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
+    const bm = (map) => new THREE.MeshStandardMaterial({ map, color: 0xffffff, roughness: 0.6, metalness: 0.1 });
+    for (const m of B.dirt) mk(m, matFor('dirtTexCanvas', m, dm), 'dirt');
+    for (const m of B.barriers) mk(m, matFor('barrierTexCanvas', m, bm), 'barrier');
+    this.triCounts.edges = B.dirtTris + B.barrierTris;
+    if (this.app.onEdgesInfo) this.app.onEdgesInfo(B);
+    this.buildCollision();
+    if (this.wire && this.wire.on) this.applyWireframe();
+    if (stats) this.updateStats();
+    this.needsFrame = true;
+  }
+
+  /** Geometría de colisión (camino de tierra y costados): semitransparente, con el check «Mostrar en la vista 3D». */
+  buildCollision() {
+    this.disposeGroup(this.collGroup);
+    this.collGroup.scale.set(1, 1, this.zExag);
+    this.collData = null;
+    const L = this.app.state.layout, E = this.app.state.result, sp = this.app.state.scene;
+    if (!L || !E || !sp.collision) { if (this.app.onCollisionInfo) this.app.onCollisionInfo(null); return; }
+    const C = buildCollisionMeshes(L, E, sp, { deck: this.app.state.elev ? this.app.state.elev.deck ?? 1 : 1 });
+    this.collData = C;
+    const mat = (c) => new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.28, depthWrite: false, side: THREE.DoubleSide });
+    const dm = mat(0x40e0ff), smat = mat(0xff5fc8);
+    Object.assign(dm, { polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }); // sobre el camino de tierra (misma altura)
+    for (const m of [...C.dirt, ...C.sides]) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
+      g.setIndex(new THREE.BufferAttribute(m.indices, 1));
+      const mesh = new THREE.Mesh(g, m.side ? smat : dm);
+      mesh.name = m.name;
+      mesh.userData.collision = m.side ? 'sides' : 'dirt';
+      mesh.renderOrder = 7;
+      mesh.raycast = () => {}; // no se elige con clic (no tapa la pista)
+      this.collGroup.add(mesh);
+    }
+    this.collGroup.visible = sp.showCollision !== false && !(this.game && this.game.active);
+    if (this.app.onCollisionInfo) this.app.onCollisionInfo(C);
+    this.updateStats();
+    this.needsFrame = true;
+  }
+
+  /** Coloca (o quita) el modelo de referencia. ref = state.ref3d o null. */
+  setReference(ref) {
+    if (this.refOuter) { this.refTc.detach(); this.refExag.remove(this.refOuter); this.refOuter = null; }
+    if (ref && ref.inner) {
+      this.refOuter = new THREE.Group();
+      this.refOuter.name = 'referencia_3d';
+      this.refOuter.add(ref.inner);
+      this.refExag.add(this.refOuter);
+    }
+    this.updateReference();
+  }
+  /** Posición, giro, escala, aspecto y gizmo del modelo de referencia. */
+  updateReference() {
+    const ref = this.app.state.ref3d, o = this.refOuter;
+    if (!o || !ref) { this.refTc.detach(); this.refTc.enabled = false; this.needsFrame = true; return; }
+    o.position.set(ref.pos[0], ref.pos[1], ref.pos[2]);
+    o.rotation.set(0, 0, THREE.MathUtils.degToRad(ref.rotZ || 0));
+    o.scale.setScalar(ref.scale || 1);
+    o.visible = ref.visible !== false;
+    applyRefLook(ref.meshes, ref.look || 'flat', ref.color || '#4fc3f7', ref.opacity ?? 0.6);
+    const on = !!ref.sel && o.visible && !ref.locked;
+    if (on) { this.refTc.attach(o); this.refTc.enabled = true; this.refTc.setMode(ref.gizmo === 'rotate' ? 'rotate' : 'translate'); this.refTc.showX = ref.gizmo !== 'rotate'; this.refTc.showY = ref.gizmo !== 'rotate'; this.refTc.showZ = true; }
+    else { this.refTc.detach(); this.refTc.enabled = false; }
+    this.needsFrame = true;
+  }
+
+  /** Clic con Navegar: selecciona el cerro bajo el cursor (o deselecciona). */
+  pickHill(e) {
+
+    const r = this.renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, this.camera);
+    const veg = this.extras.children.filter((o) => o.isMesh && o.userData.veg);
+    const rs = this.app.state.ref3d;
+    const refMeshes = this.refOuter && rs && rs.visible && !rs.locked ? rs.meshes : [];
+ const edgeMeshes = this.edgeGroup.children.filter((o) => o.isMesh);
+    const decoMeshes = [];
+    if (this.decoGroup) this.decoGroup.traverse((o) => { if (o.isInstancedMesh) decoMeshes.push(o); });
+    const water = this.waterMesh && this.extras.children.includes(this.waterMesh) ? [this.waterMesh] : [];
+    const objs = [...refMeshes, ...edgeMeshes, ...(this.riverMeshes || []), ...(this.wallMeshes || []), ...water, ...decoMeshes, ...this.itemsGroup.children, ...(this.coinMeshes || []), ...this.hillMeshes, ...(this.tunnelMeshes || []), ...(this.tunnelDecoMeshes || []), ...(this.terrainMesh ? [this.terrainMesh] : []), ...this.trackGroup.children, ...veg, ...(this.signGroup ? this.signGroup.children : [])];
+    const st0 = this.app.state;
+    // puntos de control del cerro seleccionado (se ven y se eligen a través del cerro)
+    const hcs = this.hillCtrlGroup ? ray.intersectObjects(this.hillCtrlGroup.children.filter((o) => o.isMesh), false) : [];
+    if (hcs.length && hcs[0].object.userData.hillLat != null) { this.app.selectHillLat(hcs[0].object.userData.hillLat); return; }
+    if (hcs.length) { this.app.selectHillCtrl(hcs[0].object.userData.hillCtrl); return; }
+    if (st0.selHill != null && this.app.hillCtrlMode && this.app.hillCtrlMode()) {
+      const hh = ray.intersectObjects((this.hillMeshes || []).filter((m) => m.userData.hillId === st0.selHill), false);
+      if (hh.length) { const P = hh[0].point; this.app.addHillCtrlWorld(P.x, P.y); return; }
+    }
+    // rocas y estalactitas sueltas del túnel seleccionado: se eligen aunque las tape el cerro
+    const caves = st0.selTunnel != null ? (this.caveMeshes || []).filter((m) => m.userData.cave.tid === st0.selTunnel) : [];
+    const hc = caves.length ? ray.intersectObjects(caves, false) : [];
+    if (hc.length) { this.app.selectCave({ ...hc[0].object.userData.cave }); return; }
+    if (st0.selCave) this.app.selectCave(null, false);
+    // trigger propio: clic sobre su caja lo selecciona
+    const trigMeshes = this.triggerGroup.children.filter((o) => o.userData.triggerId != null);
+    const ht = trigMeshes.length ? ray.intersectObjects(trigMeshes, false) : [];
+    const h = ray.intersectObjects(objs, false);
+    if (ht.length && (!h.length || ht[0].distance <= h[0].distance + 0.5) && this.app.selectTrigger) { this.app.selectTrigger(ht[0].object.userData.triggerId); return; }
+    if (this.app.state.selTrigger != null && this.app.selectTrigger) this.app.selectTrigger(null);
+    const ud = h.length ? h[0].object.userData : {};
+    // árbol o adorno de un grupo sin «single mesh»: se elige ese elemento (instancia o cono de la malla combinada)
+    // (se atraviesa la vegetación que no se edita, hasta el primer objeto sólido)
+    let vh = null;
+    { const u0 = h.length ? h[0].object.userData : null; // árbol de otro grupo: se trae ese grupo al panel
+      if (u0 && u0.veg === 'trees' && u0.vegGroup != null && this.app.selectVegGroup) { if (st0.selVeg) this.app.selectVeg(null, false); this.app.selectVegGroup('tree', u0.vegGroup); return; } }
+    for (const q of h) { const u = q.object.userData; if (u.vegEdit) { vh = q; break; } if (!(u.veg || u.decoSet != null)) break; }
+    if (vh && this.app.selectVeg) {
+      const hit = vh, ve = vh.object.userData.vegEdit, ud2 = vh.object.userData;
+      let i = null;
+      if (hit.object.isInstancedMesh && hit.instanceId != null) { const it = (ud2.instItems || [])[hit.instanceId]; if (it) i = it.bi; }
+      else if (hit.faceIndex != null && ve.kind === 'grass' && this.grassData) { const t = this.grassData[Math.floor(hit.faceIndex / 4)]; if (t) i = t.bi; }
+      else if (hit.faceIndex != null && this.treeData) { const t = this.treeData[Math.floor(hit.faceIndex / 16)]; if (t) i = t.bi; }
+      if (i != null) { if (this.app.state.ref3d && this.app.state.ref3d.sel) this.app.selectRef3d(false); this.app.selectVeg({ kind: ve.kind, set: ve.set ?? null, i }); return; }
+    }
+    if (st0.selVeg) this.app.selectVeg(null, false);
+    const onTrack = h.length && this.trackGroup.children.includes(h[0].object);
+    const altHit = onTrack ? this.app.altAtWorld(h[0].point.x, h[0].point.y) : null;
+    if (altHit == null && !ud.item && this.app.state.selAlt != null) this.app.selectAlt(null);
+    if (this.app.state.selBridge != null && !(onTrack && this.app.bridgeAtWorld(h[0].point.x, h[0].point.y) === this.app.state.selBridge)) this.app.selectBridge(null);
+    if (h.length && (h[0].object === this.terrainMesh || h[0].object.userData.water) && this.app.focusPanel) this.app.focusPanel('terrain'); // clic en el terreno o el agua: sus parámetros
+    if (ud.ref3d) { this.app.selectRef3d(true); return; } // modelo de referencia: se selecciona entero
+    if (ud.sign) { const list = this.signData ? this.signData.signs.filter((q) => q.type === ud.sign) : [], q = list[Math.floor((h[0].faceIndex || 0) / (ud.signTris || 2))]; if (this.app.focusSign) this.app.focusSign(q ? q.curve : null); return; } // cartel: la señalética (y su curva)
+    if (ud.cutWall) { this.app.selectHill(null); if (ud.cutIdx != null && this.app.selectBridge) this.app.selectBridge(ud.cutIdx); else if (this.app.focusPanel) this.app.focusPanel('bridges'); return; } // paredes de un tramo socavado: su tarjeta
+    if (ud.riverWall) { this.app.selectHill(null); if (ud.riverId != null && this.app.selectRiver) this.app.selectRiver(ud.riverId); else if (this.app.focusPanel) this.app.focusPanel('rivers', document.getElementById('riverWallHead')); return; } // paredes de un río: su tarjeta
+    if (ud.riverId != null) { this.app.selectHill(null); if (this.app.selectRiver) this.app.selectRiver(ud.riverId); return; } // río o cascada: su tarjeta
+    if (ud.decoSet != null) { // elemento decorativo: su set
+      if (this.app.state.ref3d && this.app.state.ref3d.sel) this.app.selectRef3d(false);
+      this.app.selectHill(null);
+      if (this.app.selectDecoSet) this.app.selectDecoSet(ud.decoSet);
+      return;
+    }
+    if (ud.edge && ud.bridge != null && this.app.selectBridge) { this.app.selectHill(null); this.app.selectBridge(ud.bridge); return; } // borde de un puente: su tarjeta
+    if (ud.edge) { // barrera o camino de tierra: sus parámetros
+      if (this.app.state.ref3d && this.app.state.ref3d.sel) this.app.selectRef3d(false);
+      this.app.selectHill(null);
+      const r = this.app.state.layout && this.app.state.layout.routes[ud.k];
+      if (ud.alt && r && this.app.focusAltEdge) this.app.focusAltEdge(r.altIndex, ud.edge); // los de un atajo: en su tarjeta
+      else if (this.app.focusPanel) this.app.focusPanel('edges', document.getElementById(ud.edge === 'barrier' ? 'barrierHead' : 'dirtHead'));
+      return;
+    }
+    if (this.app.state.ref3d && this.app.state.ref3d.sel) this.app.selectRef3d(false);
+    if (ud.veg) { // árboles o hierba: sus parámetros
+      this.app.selectHill(null);
+      if (this.app.focusPanel) this.app.focusPanel('trees', ud.veg === 'grass' ? document.getElementById('grass') : document.getElementById('trees'));
+      return;
+    }
+    if (ud.item) this.app.selectItem(ud.item);
+    else if (altHit != null) this.app.selectAlt(altHit);
+    else if (onTrack && this.app.bridgeAtWorld && this.app.bridgeAtWorld(h[0].point.x, h[0].point.y) != null) this.app.selectBridge(this.app.bridgeAtWorld(h[0].point.x, h[0].point.y));
+    else if (onTrack) { this.app.selectHill(null); if (this.app.focusPanel) this.app.focusPanel('tracktex'); } // clic en la pista: su textura
+    else if (ud.tunnelId != null) this.app.selectTunnel(ud.tunnelId);
+    else this.app.selectHill(ud.hillId != null ? ud.hillId : null);
+  }
+
+  findItem(ref) {
+    if (!ref) return null;
+    for (const g of this.app.itemInstances()) if (g.type === ref.type && g.gid === ref.gid) return g.items.find((it) => it.idx === ref.idx) || null;
+    return null;
+  }
+
+  /** Elementos de pista como mallas separadas (pivote en la base, alineadas con la calzada). */
+  buildItems() {
+    this.disposeGroup(this.itemsGroup);
+    this.itemsGroup.scale.set(1, 1, this.zExag);
+    const inst = this.app.itemInstances ? this.app.itemInstances() : [];
+    const sel = this.app.state.selItem;
+    if (!this.padCanvas) this.padCanvas = makePadCanvas();
+    const IT = this.app.state.itemTex || {};
+    if (!this.glowCanvas) this.glowCanvas = makeGlowCanvas();
+    const tPud = this.texture(IT.puddle), tStr = this.texture(IT.strip), tCoin = this.texture(IT.coin);
+    const mats = {
+      puddle: new THREE.MeshStandardMaterial({ color: tPud ? 0xffffff : 0x3a8fe8, map: tPud, roughness: 0.08, metalness: 0.3, transparent: true, opacity: 0.88, polygonOffset: true, polygonOffsetFactor: -2 }),
+      pad: new THREE.MeshStandardMaterial({ map: this.texture(IT.pad || this.padCanvas), roughness: 0.6, polygonOffset: true, polygonOffsetFactor: -3 }),
+      strip: new THREE.MeshStandardMaterial({ color: tStr ? 0xffffff : 0x22c55e, map: tStr, emissive: tStr ? 0x000000 : 0x0b5d2a, emissiveIntensity: 0.6, roughness: 0.5, polygonOffset: true, polygonOffsetFactor: -2 }),
+      coin: new THREE.MeshStandardMaterial({ color: tCoin ? 0xffffff : 0xfacc15, map: tCoin, emissive: tCoin ? 0x000000 : 0x6b5200, emissiveIntensity: 0.6, roughness: 0.5, polygonOffset: true, polygonOffsetFactor: -2 }),
+    };
+    const coinMat = new THREE.MeshStandardMaterial({ color: 0xffc41f, emissive: 0x7a5200, emissiveIntensity: 0.5, metalness: 0.6, roughness: 0.3 });
+    const coinGeos = new Map(); // por diámetro
+    this.coinSpins = []; this.coinMeshes = [];
+    const borderMat = new THREE.MeshBasicMaterial({ map: this.texture(IT.border || this.glowCanvas), transparent: true, depthWrite: false, side: THREE.FrontSide });
+    let tris = 0, count = 0;
+    const M = new THREE.Matrix4();
+    for (const g of inst) for (const it of g.items) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(it.positions, 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(it.uvs, 2));
+      geo.setIndex(it.indices);
+      geo.computeVertexNormals();
+      const isSel = sel && sel.type === it.type && sel.gid === it.gid && sel.idx === it.idx;
+      const mat = isSel ? mats[it.type].clone() : mats[it.type];
+      if (isSel) { mat.emissive = new THREE.Color(0x8a6d00); mat.emissiveIntensity = 0.5; }
+      const m = new THREE.Mesh(geo, mat);
+      m.position.set(...it.origin);
+      if (it.basis) {
+        const [T, Lt, U] = it.basis;
+        M.makeBasis(new THREE.Vector3(...T), new THREE.Vector3(...Lt), new THREE.Vector3(...U));
+        m.quaternion.setFromRotationMatrix(M);
+      }
+      m.name = it.name;
+      m.userData.item = { type: it.type, gid: it.gid, idx: it.idx };
+      if (it.border) {
+        const bg = new THREE.BufferGeometry();
+        bg.setAttribute('position', new THREE.BufferAttribute(it.border.positions, 3));
+        bg.setAttribute('uv', new THREE.BufferAttribute(it.border.uvs, 2));
+        bg.setIndex(it.border.indices);
+        bg.computeVertexNormals();
+        const bm = new THREE.Mesh(bg, borderMat);
+        bm.renderOrder = 3;
+        m.add(bm);
+        tris += it.border.indices.length / 3;
+      }
+      if (it.coins && it.coins.length) { // monedas: de pie, de cara a la marcha; giran sobre su eje vertical en la cámara de juego
+        const D = it.coinSize;
+        if (!coinGeos.has(D)) coinGeos.set(D, new THREE.CylinderGeometry(D / 2, D / 2, Math.max(0.02, D * 0.12), 24));
+        const cg = coinGeos.get(D);
+        for (const c of it.coins) {
+          const wrap = new THREE.Object3D(); // compensa la exageración vertical del grupo (la moneda queda redonda)
+          wrap.position.set(...c.p);
+          wrap.scale.set(1, 1, 1 / (this.zExag || 1));
+          const piv = new THREE.Object3D();
+          M.makeBasis(new THREE.Vector3(...c.T), new THREE.Vector3(...c.Lat), new THREE.Vector3(...c.U));
+          piv.quaternion.setFromRotationMatrix(M);
+          const spin = new THREE.Object3D();
+          const cm = new THREE.Mesh(cg, coinMat);
+          cm.rotation.z = Math.PI / 2; // eje del cilindro a lo largo de la marcha
+          cm.name = c.name;
+          cm.userData.item = { type: it.type, gid: it.gid, idx: it.idx };
+          spin.add(cm); piv.add(spin); wrap.add(piv); m.add(wrap);
+          this.coinSpins.push(spin); this.coinMeshes.push(cm);
+          tris += 24 * 4;
+        }
+      }
+      m.renderOrder = 2;
+      this.itemsGroup.add(m);
+      tris += it.indices.length / 3;
+      count++;
+    }
+    this.triCounts.items = tris;
+    this.itemCount = count;
+    if (this.statsDiv) this.updateStats();
+    this.needsFrame = true;
+  }
+
+  setPaintMode(m) {
+    this.paintMode = m;
+    if (!m) { this.brushRing.visible = false; this.needsFrame = true; }
+    this.refreshPaintOverlay();
+  }
+
+  /** Material de las paredes socavadas: ríos o cascadas (textura propia o roca por defecto). */
+  /** Material del cauce de una cascada: su textura propia (tarjeta) o roca por defecto. */
+  fallWallMaterial(id) {
+    const cv = this.app.riverOwnTex && id != null ? this.app.riverOwnTex(id, 'wallFall') : null;
+    const t = this.texture(cv);
+    if (t) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.needsUpdate = true; }
+    return new THREE.MeshStandardMaterial({ map: t, color: t ? 0xffffff : 0x7b7670, roughness: 1, metalness: 0, side: THREE.DoubleSide });
+  }
+  wallMaterial(kind) {
+    const cv = this.app.wallTexCanvas ? this.app.wallTexCanvas(kind) : null;
+    const t = this.texture(cv);
+    if (t) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.needsUpdate = true; }
+    return new THREE.MeshStandardMaterial({ map: t, color: t ? 0xffffff : kind === 'fall' ? 0x7b7670 : 0x6d6258, roughness: 1, metalness: 0, side: THREE.DoubleSide });
+  }
+
+  /** Altura visible (con la exageración Z) de la superficie en (x, y): terreno y cerros; null si no hay terreno. */
+  surfaceZ(x, y) {
+    const G = this.groundCache, T0 = this.terrainData;
+    if (!G || !T0) return null;
+    const g = G.sample(x, y), t = T0.sample(x, y);
+    if (!Number.isFinite(g)) return null;
+    return g + (Number.isFinite(t) ? t : 0) * (this.zExag - 1);
+  }
+
+  /** Coloca el aro del pincel en pt con radio r, amoldado a la superficie que hay debajo. */
+  shapeBrushRing(pt, r) {
+    const N = BRUSH_SEGS, pos = this.brushRing.geometry.getAttribute('position'), a = pos.array;
+    const w = Math.max(0.25, Math.min(r * 0.08, 3));
+    const z0 = this.surfaceZ(pt.x, pt.y);
+    const lift = Math.max(0.15, r * 0.004);
+    for (let i = 0; i <= N; i++) {
+      const t = (i / N) * Math.PI * 2, c = Math.cos(t), s = Math.sin(t);
+      for (let k = 0; k < 2; k++) {
+        const rr = k ? r : r - w;
+        const x = pt.x + c * rr, y = pt.y + s * rr;
+        let z = this.surfaceZ(x, y);
+        if (z == null || z0 == null) z = pt.z; // sin terreno: plano a la altura del punto
+        const v = (i * 2 + k) * 3;
+        a[v] = x; a[v + 1] = y; a[v + 2] = z + lift;
+      }
+    }
+    pos.needsUpdate = true;
+    this.brushRing.position.set(0, 0, 0);
+    this.brushRing.scale.setScalar(1);
+  }
+
+  /**
+   * Zonas pintadas iluminadas en 3D mientras se usa un pincel: las mismas mallas de terreno y cerros, dibujadas otra
+   * vez con una máscara (lienzo en coordenadas del mundo) que se rehace en cada toque del pincel.
+   */
+  refreshPaintOverlay() {
+    if (this._povRaf) return;
+    this._povRaf = requestAnimationFrame(() => { this._povRaf = 0; this.drawPaintOverlay(); });
+  }
+  drawPaintOverlay() {
+    const info = this.paintMode && this.app.paintOverlayStrokes ? this.app.paintOverlayStrokes() : null;
+    if (!info || !info.strokes.length) { if (this.paintOverlay) { this.paintOverlay.visible = false; this.needsFrame = true; } return; }
+    const L = this.app.state.layout;
+    if (!L) return;
+    // límites: los del terreno o, si no hay, los de la pista con margen
+    let B = this.terrainData && this.terrainData.bounds;
+    if (!B) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const r of L.routes) for (let i = 0; i < r.n; i++) { minX = Math.min(minX, r.x[i]); minY = Math.min(minY, r.y[i]); maxX = Math.max(maxX, r.x[i]); maxY = Math.max(maxY, r.y[i]); }
+      const m = 300;
+      B = { minX: minX - m, minY: minY - m, maxX: maxX + m, maxY: maxY + m };
+    }
+    if (!this.paintOverlay) {
+      const cv = document.createElement('canvas');
+      cv.width = cv.height = 1024;
+      const tex = new THREE.CanvasTexture(cv);
+      tex.colorSpace = THREE.NoColorSpace;
+      tex.minFilter = THREE.LinearFilter;
+      const mat = new THREE.ShaderMaterial({
+        uniforms: { uMask: { value: tex }, uMin: { value: new THREE.Vector2() }, uSize: { value: new THREE.Vector2(1, 1) }, uColor: { value: new THREE.Color(0xe040fb) }, uTime: { value: 0 } },
+        vertexShader: 'varying vec2 vW; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xy; gl_Position = projectionMatrix * viewMatrix * w; }',
+        fragmentShader: 'uniform sampler2D uMask; uniform vec2 uMin; uniform vec2 uSize; uniform vec3 uColor; varying vec2 vW; void main(){ vec2 uv = (vW - uMin) / uSize; if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) discard; float a = texture2D(uMask, uv).a; if (a < 0.01) discard; gl_FragColor = vec4(uColor * (0.7 + 0.6 * a), 0.28 + 0.4 * a); }',
+        transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8, side: THREE.DoubleSide,
+      });
+      this.paintOverlay = new THREE.Group();
+      this.paintOverlay.userData.canvas = cv; this.paintOverlay.userData.tex = tex; this.paintOverlay.userData.mat = mat;
+      this.paintOverlay.renderOrder = 5;
+      this.scene.add(this.paintOverlay);
+    }
+    const ov = this.paintOverlay, cv = ov.userData.canvas, mat = ov.userData.mat;
+    // mallas sobre las que se dibuja (se comparten las geometrías: siguen la exageración Z)
+    const surf = [...(this.terrainMesh ? [this.terrainMesh] : []), ...(this.hillMeshes || []), ...(this.wallMeshes || [])];
+    const key = surf.map((m) => m.geometry.uuid).join(',') + (surf.length ? '' : `plane:${B.minX},${B.minY}`);
+    if (ov.userData.key !== key) {
+      for (const c of [...ov.children]) { ov.remove(c); if (c.userData.ownGeo) c.geometry.dispose(); }
+      if (surf.length) for (const m of surf) { m.updateWorldMatrix(true, false); const o = new THREE.Mesh(m.geometry, mat); o.matrixAutoUpdate = false; o.matrix.copy(m.matrixWorld); o.renderOrder = 5; ov.add(o); }
+      else { const g = new THREE.PlaneGeometry(B.maxX - B.minX, B.maxY - B.minY).translate((B.minX + B.maxX) / 2, (B.minY + B.maxY) / 2, 0.05); const o = new THREE.Mesh(g, mat); o.userData.ownGeo = true; o.renderOrder = 5; ov.add(o); }
+      ov.userData.key = key;
+    }
+    const W = B.maxX - B.minX, H = B.maxY - B.minY;
+    mat.uniforms.uMin.value.set(B.minX, B.minY);
+    mat.uniforms.uSize.value.set(W, H);
+    mat.uniforms.uColor.value.set(info.color || 0xe040fb);
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    // canvas: y hacia abajo; uv.y = 0 es la primera fila de la textura (flipY) → se dibuja con Y invertida
+    const sx = cv.width / W, sy = cv.height / H;
+    for (const st of info.strokes) {
+      ctx.globalCompositeOperation = st.e ? 'destination-out' : 'source-over';
+      ctx.fillStyle = `rgba(255,255,255,${st.a ?? 1})`;
+      ctx.beginPath();
+      ctx.ellipse((st.x - B.minX) * sx, (B.maxY - st.y) * sy, Math.max(1, st.r * sx), Math.max(1, st.r * sy), 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    ov.userData.tex.needsUpdate = true;
+    ov.visible = true;
+    this.needsFrame = true;
+  }
+
+  setGizmoMode(m) {
+    this.gizmoMode = m;
+    const xf = (this.app.state && this.app.state.xform) || 'move';
+    if (xf === 'rotate') { this.tc.setMode('rotate'); this.tc.showX = false; this.tc.showY = false; this.tc.showZ = true; }
+    else if (xf === 'scale') { this.tc.setMode('scale'); this.tc.showX = true; this.tc.showY = true; this.tc.showZ = true; }
+    else {
+      this.tc.setMode('translate');
+      this.tc.showX = m !== 'z';
+      this.tc.showY = m !== 'z';
+      this.tc.showZ = m !== 'xy';
+    }
+    this.needsFrame = true;
+  }
+  /** Cinta amarilla sobre los segmentos seleccionados (nivel Segmento). */
+  updateSegHighlight() {
+    for (const c of [...this.segGroup.children]) { this.segGroup.remove(c); c.geometry?.dispose(); c.material?.dispose(); }
+    const st = this.app.state, L = st.layout, E = st.result;
+    if (st.tool !== 'edit' || st.subObj !== 'segment' || !L || !E || !this.app.segSelRanges) return;
+    const ex = this.zExag;
+    for (const R of this.app.segSelRanges()) {
+      const r = L.routes[R.k], z = E.routes[R.k].z;
+      const i0 = Math.floor(R.s0 / r.ds), i1 = Math.ceil(R.s1 / r.ds);
+      const pos = [], idx = [];
+      for (let ii = i0; ii <= i1; ii++) {
+        const i = r.closed ? ((ii % r.n) + r.n) % r.n : Math.max(0, Math.min(r.n - 1, ii));
+        const hw = r.w[i] * 0.32, nx = -r.ty[i], ny = r.tx[i], zz = z[i] * ex + 0.25;
+        pos.push(r.x[i] + nx * hw, r.y[i] + ny * hw, zz, r.x[i] - nx * hw, r.y[i] - ny * hw, zz);
+        const v = (ii - i0) * 2;
+        if (ii > i0) idx.push(v - 2, v - 1, v, v - 1, v + 1, v);
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      g.setIndex(idx);
+      const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xffe066, transparent: true, opacity: 0.55, depthTest: false, side: THREE.DoubleSide }));
+      m.renderOrder = 9;
+      this.segGroup.add(m);
+    }
+  }
+  /** Segmento de la pista bajo el cursor en 3D (nivel Segmento) o null. */
+  pickSegment(e) {
+    const r = this.renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, this.camera);
+    const h = ray.intersectObjects(this.trackGroup.children, false);
+    if (!h.length) return null;
+    return this.app.segmentAtWorld(h[0].point.x, h[0].point.y, 12);
+  }
+
+  handleRadius() {
+    const L = this.app.state.layout;
+    return 0.4 * (L ? Math.max(1.5, L.gp.width * 0.28) : 3); // 40 % del tamaño anterior
+  }
+
+  updateHandles() {
+    for (const c of [...this.handleGroup.children]) {
+      this.handleGroup.remove(c);
+      c.geometry?.dispose();
+      c.material?.dispose();
+    }
+    const st = this.app.state;
+    this.vegRing = null;
+    if (st.tool === 'pan' && st.selVeg && st.layout && st.result) {
+      // árbol o adorno seleccionado: anillo amarillo en el suelo y gizmo solo en el plano XY
+      const vi = this.vegItem(st.selVeg);
+      if (vi) {
+        const ring = new THREE.Mesh(new THREE.RingGeometry(vi.r * 0.86, vi.r, 40), new THREE.MeshBasicMaterial({ color: 0xffd54f, depthTest: false, transparent: true, opacity: 0.95, side: THREE.DoubleSide }));
+        ring.position.set(vi.x, vi.y, this.vegZ(vi.x, vi.y, vi.z) + 0.15);
+        ring.renderOrder = 12;
+        this.handleGroup.add(ring);
+        this.vegRing = ring;
+        if (!this.tc.dragging) {
+          this.tc.setMode('translate');
+          this.tc.showX = true; this.tc.showY = true; this.tc.showZ = false;
+          this.proxy.position.set(vi.x, vi.y, this.vegZ(vi.x, vi.y, vi.z) + 0.3);
+          this.tc.attach(this.proxy);
+        }
+      } else if (!this.tc.dragging) this.tc.detach();
+      this.needsFrame = true;
+      return;
+    }
+    if (st.tool === 'pan' && st.selCave && st.layout && st.result) {
+      // roca o estalactita seleccionada: gizmo solo en el plano XY
+      const ci = this.caveItem(st.selCave);
+      if (ci && ci.mesh && !this.tc.dragging) {
+        this.tc.setMode('translate');
+        this.tc.showX = true; this.tc.showY = true; this.tc.showZ = false;
+        this.proxy.position.copy(ci.mesh.position);
+        this.tc.attach(this.proxy);
+      } else if (!ci && !this.tc.dragging) this.tc.detach();
+      this.needsFrame = true;
+      return;
+    }
+    if (st.tool === 'pan' && st.selItem && st.layout && st.result) {
+      // elemento de pista seleccionado: gizmo solo en el plano XY
+      const it = this.findItem(st.selItem);
+      if (it && !this.tc.dragging) {
+        this.tc.showX = true; this.tc.showY = true; this.tc.showZ = false;
+        this.proxy.position.set(it.origin[0], it.origin[1], it.origin[2] * this.zExag + 0.3);
+        this.tc.attach(this.proxy);
+      }
+      this.needsFrame = true;
+      return;
+    }
+    if (st.tool !== 'edit' || !st.layout || !st.result) {
+      if (!this.tc.dragging) this.tc.detach();
+      this.needsFrame = true;
+      return;
+    }
+    if (!this.tc.dragging) this.setGizmoMode(this.gizmoMode || 'free');
+    this.updateSegHighlight();
+    const segMode = st.subObj === 'segment', xf = st.xform || 'move';
+    const ex = this.zExag;
+    const rad = this.handleRadius();
+    const geo = new THREE.SphereGeometry(rad, 14, 10);
+    let selPt = null;
+    const ms = st.selSet && st.selSet.idxs.size > 0 ? st.selSet : null;
+    const cen = new THREE.Vector3();
+    let cenN = 0;
+    for (const pt of this.app.ctrlPoints()) {
+      const inMulti = ms && ms.key === pt.key && ms.idxs.has(pt.idx);
+      const isSel = !segMode && ((st.sel && st.sel.key === pt.key && st.sel.idx === pt.idx) || inMulti);
+      const color = isSel ? 0xffe066 : pt.pin !== null ? 0xf2a93b : pt.k > 0 ? 0x9fd4ff : 0xffffff;
+      const m = new THREE.Mesh(geo.clone(), new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.95 }));
+      const z = pt.pin !== null ? pt.pin : pt.z;
+      m.position.set(pt.X, pt.Y, z * ex + rad * 0.6);
+      if (isSel) m.scale.setScalar(1.5); else if (segMode) m.scale.setScalar(0.6);
+      m.renderOrder = 10;
+      m.userData = { key: pt.key, idx: pt.idx };
+      this.handleGroup.add(m);
+      if (inMulti) { cen.add(m.position); cenN++; }
+      else if (isSel) selPt = m.position.clone();
+    }
+    if (cenN > 0) selPt = cen.multiplyScalar(1 / cenN);
+    if (xf !== 'move' && cenN < 2) selPt = null; // rotar / escalar necesitan 2 o más puntos
+    geo.dispose();
+    if (selPt) {
+      if (!this.tc.dragging) {
+        this.proxy.position.copy(selPt);
+        this.proxy.rotation.set(0, 0, 0);
+        this.proxy.scale.set(1, 1, 1);
+        this.tc.attach(this.proxy);
+      }
+    } else if (!this.tc.dragging) this.tc.detach();
+    this.needsFrame = true;
+  }
+
+  pickHandle(e) {
+    const r = this.renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, this.camera);
+    const hits = ray.intersectObjects(this.handleGroup.children, false);
+    return hits.length ? { ...hits[0].object.userData } : null;
+  }
+
+  pick(e) {
+    if (this.app.state.subObj === 'segment') { this.app.selectSegment(this.pickSegment(e), false); return; }
+    const r = this.renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, this.camera);
+    const hits = ray.intersectObjects(this.handleGroup.children, false);
+    if (hits.length) this.app.selectCtrl({ ...hits[0].object.userData });
+    else this.app.selectCtrl(null);
+  }
+
+  onDragStart() {
+    const st = this.app.state;
+    if (st.tool === 'pan' && st.selVeg) { this.vegDragMode = true; this.vegDragLast = null; return; }
+    if (st.tool === 'pan' && st.selCave) { this.caveDragMode = true; return; }
+    if (st.tool === 'pan' && st.selItem) {
+      this.itemDragMode = true;
+      this.dragStart = this.proxy.position.clone();
+      this.app.beginItemDrag(st.selItem);
+      return;
+    }
+    // escalar con el eje Z del gizmo (modo de elevación Directo): escala la altura de los puntos
+    if (st.xform === 'scale' && st.elev.mode === 'direct' && this.tc.axis === 'Z' && st.selSet && st.selSet.idxs.size > 1 && this.app.beginZScale()) {
+      this.xformMode = 'zscale';
+      this.dragSel = { group: true };
+      return;
+    }
+    if ((st.xform === 'rotate' || st.xform === 'scale') && st.selSet && st.selSet.idxs.size > 1 && this.app.beginXform()) {
+      this.xformMode = st.xform;
+      this.dragSel = { group: true };
+      return;
+    }
+    if (st.selSet && st.selSet.idxs.size > 0 && this.app.beginGroupDrag()) {
+      this.groupMode = true;
+      this.dragSel = { group: true };
+      this.dragStart = this.proxy.position.clone();
+      return;
+    }
+    const sel = st.sel;
+    if (!sel) return;
+    this.dragSel = { ...sel };
+    this.dragStart = this.proxy.position.clone();
+    this.app.beginCtrlDrag(sel.key, sel.idx);
+  }
+
+  onGizmoMove() {
+    if (this.vegDragMode) {
+      const p = this.proxy.position;
+      const P = this.moveVegLive(this.app.state.selVeg, p.x, p.y);
+      if (P) { this.vegDragLast = P; if (this.app.onVegLive) this.app.onVegLive(); }
+      return;
+    }
+    if (this.caveDragMode) {
+      const p = this.proxy.position;
+      const P = this.moveCaveLive(this.app.state.selCave, p.x, p.y);
+      if (P) this.caveDragLast = P;
+      return;
+    }
+    if (this.itemDragMode) {
+      const p = this.proxy.position;
+      this.app.dragItemBy(p.x - this.dragStart.x, p.y - this.dragStart.y);
+      // el gizmo sigue al elemento ya ajustado a la pista
+      const it = this.findItem(this.app.state.selItem);
+      if (it) this.proxy.position.z = it.origin[2] * this.zExag + 0.3;
+      return;
+    }
+    const d = this.dragSel;
+    if (!d) return;
+    const p = this.proxy.position;
+    if (this.xformMode === 'zscale') { this.app.applyZScale(this.proxy.scale.z); return; }
+    if (this.xformMode === 'rotate') { this.app.applyXform({ type: 'rotate', a: -this.proxy.rotation.z }); return; } // y del lienzo invertida
+    if (this.xformMode === 'scale') {
+      const c = (v) => Math.max(0.02, Math.min(50, v));
+      const S = this.proxy.scale, u = this.tc.axis === 'XYZ';
+      this.app.applyXform({ type: 'scale', sx: c(u ? S.x : S.x), sy: c(u ? S.x : S.y) });
+      return;
+    }
+    if (this.groupMode) {
+      const L = this.app.state.layout;
+      const dX = p.x - this.dragStart.x, dY = p.y - this.dragStart.y, dZ = p.z - this.dragStart.z;
+      const dz = dZ / this.zExag;
+      const dx = dX / L.scale, dy = -dY / L.scale;
+      if (this.gizmoMode === 'z') this.app.applyGroupDelta(0, 0, dz);
+      else if (this.gizmoMode === 'xy') this.app.applyGroupDelta(dx, dy, null);
+      else this.app.applyGroupDelta(dx, dy, Math.abs(dZ) > 1e-4 ? dz : null);
+      return;
+    }
+    const rad = this.handleRadius();
+    const zM = (p.z - rad * 0.6) / this.zExag;
+    const zMoved = Math.abs(p.z - this.dragStart.z) > 1e-4;
+    if (this.gizmoMode === 'z') {
+      this.app.setPin(d.key, d.idx, zM);
+    } else {
+      this.app.moveCtrl3D(d.key, d.idx, p.x, p.y, this.gizmoMode !== 'xy' && zMoved ? zM : null);
+    }
+  }
+
+  onDragEnd() {
+    if (this.vegDragMode) {
+      this.vegDragMode = false;
+      if (this.vegDragLast) this.app.commitVegMove(this.app.state.selVeg, this.vegDragLast);
+      this.vegDragLast = null;
+      return;
+    }
+    if (this.caveDragMode) {
+      this.caveDragMode = false;
+      if (this.caveDragLast) this.app.commitCaveMove(this.app.state.selCave, this.caveDragLast);
+      this.caveDragLast = null;
+      return;
+    }
+    if (this.itemDragMode) {
+      this.itemDragMode = false;
+      this.app.endItemDrag();
+      const it = this.findItem(this.app.state.selItem);
+      if (it) this.proxy.position.set(it.origin[0], it.origin[1], it.origin[2] * this.zExag + 0.3);
+      this.needsFrame = true;
+      return;
+    }
+    this.dragSel = null;
+    if (this.xformMode) { if (this.xformMode === 'zscale') this.app.endZScale(); else this.app.endXform(); this.xformMode = null; this.proxy.rotation.set(0, 0, 0); this.proxy.scale.set(1, 1, 1); }
+    else if (this.groupMode) { this.groupMode = false; this.app.endGroupDrag(); } else this.app.endCtrlDrag();
+    this.updateHandles();
+  }
+
+  /**
+   * Planos de sombra (árboles y sets de decoración con «Proyectar sombra»): una malla unida sobre terreno, cerros y
+   * calzada. Se rehace sola sin reconstruir el terreno (cambios de sol, tamaño, textura o de los sets).
+   */
+  buildShadowMesh(info = null) {
+    if (this.shadowMesh) { this.extras.remove(this.shadowMesh); this.shadowMesh.geometry.dispose(); this.shadowMesh.material.dispose(); this.shadowMesh = null; }
+    const L = this.app.state.layout, E = this.app.state.result, sp = this.app.state.scene;
+    this.triCounts.shadows = 0;
+    this.shadowInfo = { count: 0, tris: 0, hist: {} };
+    if (L && E && sp.shadows) {
+      const ground = this.groundCache || null;
+      const hasAsset = (id) => !!(this.app.assetById && this.app.assetById(id));
+      const sets = (this.app.state.decoSets || []).filter((q) => q.shadow && q.visible !== false);
+      const decoRes = sets.length ? decoSetItems(L, E, sp, ground, sets, (set) => this.app.decoPaintWorld(set), hasAsset) : [];
+      if (this.shadowTrees) { // la casilla y la posición de la sombra de cada grupo se leen al momento (cambian sin rehacer los árboles)
+        const gs = vegGroups(sp, 'tree');
+        for (const t of this.shadowTrees) { const g = gs[t.g | 0]; if (g) { t.sh = !!g.treeShadow; t.shm = g.treeShadowMode || 'global'; } }
+      }
+      const cas = shadowCasters(sp, this.shadowTrees || null, decoRes, (id) => (this.app.assetById ? this.app.assetById(id) : null));
+      const T0 = this.terrainData;
+      const SH = buildShadows(L, E, sp, ground, cas, { baseAt: T0 ? (x, y) => T0.sample(x, y) : null });
+      if (SH.tris) {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.BufferAttribute(SH.positions, 3));
+        g.setAttribute('uv', new THREE.BufferAttribute(SH.uvs, 2));
+        g.setIndex(new THREE.BufferAttribute(SH.indices, 1));
+        const mat = new THREE.MeshBasicMaterial({ map: this.texture(this.app.shadowTexCanvas()), transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+        const sm = new THREE.Mesh(g, mat);
+        this.markExag(sm, (x, y, z, v) => (SH.kinds[v] && T0 ? T0.sample(x, y) : z)); // sobre un cerro: se apoya; en terreno y calzada: se estira como ellos
+        const k = this.zExag - 1, a = g.getAttribute('position').array, ex = sm.userData.exag;
+        for (let v = 0; v < a.length / 3; v++) a[v * 3 + 2] = ex.base[v * 3 + 2] + ex.shift[v] * k;
+        sm.renderOrder = 3;
+        sm.userData.noWire = true;
+        sm.userData.shadows = true;
+        this.extras.add(sm);
+        this.shadowMesh = sm;
+      }
+      this.shadowInfo = { count: SH.count, tris: SH.tris, hist: SH.hist };
+      this.triCounts.shadows = SH.tris;
+    }
+    if (info) { info.shadows = this.shadowInfo.count; info.shadowTris = this.shadowInfo.tris; }
+    else { this.updateStats(); if (this.app.onShadowInfo) this.app.onShadowInfo(this.shadowInfo); }
+    this.updateSunLight();
+    this.needsFrame = true;
+  }
+
+  /** La luz direccional sigue al sol de los planos de sombra (modo proyectado con «La luz sigue al sol»). */
+  updateSunLight() {
+    const sp = this.app.state.scene;
+    if (sp && sp.shadows && shadowUsesSun(sp, this.app.state.decoSets) && sp.sunLight !== false) { const v = sunVector(sp); this.sunLight.position.set(v[0] * 1000, v[1] * 1000, v[2] * 1000); }
+    else this.sunLight.position.set(400, -300, 800);
+    this.needsFrame = true;
+  }
+
+  /** Caja (en la vista 3D, con la exageración Z) de lo seleccionado, o null si no hay nada seleccionado. */
+  selectionBox() {
+    const st = this.app.state, L = st.layout, E = st.result;
+    const box = new THREE.Box3(), v = new THREE.Vector3();
+    const ex = this.zExag;
+    const routeRange = (k, s0, s1) => {
+      if (!L || !E || !L.routes[k]) return;
+      const r = L.routes[k], z = E.routes[k].z;
+      const i0 = Math.floor(s0 / r.ds), i1 = Math.ceil(s1 / r.ds);
+      for (let ii = i0; ii <= i1; ii++) { const i = r.closed ? ((ii % r.n) + r.n) % r.n : Math.max(0, Math.min(r.n - 1, ii)); box.expandByPoint(v.set(r.x[i], r.y[i], z[i] * ex)); }
+    };
+    const meshes = (list) => { for (const m of list) { m.geometry.computeBoundingBox(); const b = m.geometry.boundingBox.clone().applyMatrix4(m.matrixWorld); box.union(b); } };
+    if (st.tool === 'edit' && st.subObj === 'segment' && this.app.segSelRanges) {
+      for (const R of this.app.segSelRanges()) routeRange(R.k, R.s0, R.s1);
+    }
+    if (box.isEmpty() && st.tool === 'edit' && (st.sel || (st.selSet && st.selSet.idxs.size))) {
+      for (const m of this.handleGroup.children) {
+        const u = m.userData;
+        const on = (st.sel && st.sel.key === u.key && st.sel.idx === u.idx) || (st.selSet && st.selSet.key === u.key && st.selSet.idxs.has(u.idx));
+        if (on) box.expandByPoint(m.position);
+      }
+    }
+    if (box.isEmpty() && st.selHill != null) meshes((this.hillMeshes || []).filter((m) => m.userData.hillId === st.selHill));
+    if (box.isEmpty() && st.selTunnel != null) meshes((this.tunnelMeshes || []).filter((m) => m.userData.tunnelId === st.selTunnel));
+    if (box.isEmpty() && st.selRiver != null) { const list = []; this.extras.traverse((o) => { if (o.isMesh && o.userData.riverId === st.selRiver) list.push(o); }); meshes(list); }
+    if (box.isEmpty() && st.selItem && this.findItem) { const it = this.findItem(st.selItem); if (it) { box.expandByPoint(v.set(it.origin[0], it.origin[1], it.origin[2] * ex)); box.expandByScalar(4); } }
+    if (box.isEmpty() && st.selAlt != null && L) { const k = L.routes.findIndex((r) => r.kind === 'alt' && r.altIndex === st.selAlt); if (k > 0) routeRange(k, 0, L.routes[k].L); }
+    if (box.isEmpty() && st.selBridge != null && L) { const b = (L.routes[0].bridges || []).find((q) => q.idx === st.selBridge); if (b) routeRange(0, b.s0, b.s1); }
+    if (box.isEmpty() && st.selCross != null && E) { const c = E.crossings.find((q) => q.id === st.selCross); if (c) routeRange(c.ra, c.sa - 15, c.sa + 15); }
+    if (box.isEmpty() && st.ref3d && st.ref3d.sel && this.refOuter) { box.setFromObject(this.refOuter); }
+    return box.isEmpty() ? null : box;
+  }
+
+  /** Tecla F: encuadra lo seleccionado (sin selección, toda la pista), con una transición corta. */
+  focusSelection() {
+    const b = this.selectionBox();
+    if (!b) { this.fit(); return false; }
+    const c = new THREE.Vector3(), sz = new THREE.Vector3();
+    b.getCenter(c); b.getSize(sz);
+    const radius = Math.max(8, sz.length() / 2);
+    const fov = THREE.MathUtils.degToRad(this.camera.fov || 50);
+    const dist = Math.max(15, (radius / Math.sin(fov / 2)) * 1.15);
+    const dir = new THREE.Vector3().subVectors(this.camera.position, this.controls.target);
+    if (dir.lengthSq() < 1e-6) dir.set(0, -1, 0.8);
+    dir.normalize();
+    const t0 = this.controls.target.clone(), p0 = this.camera.position.clone();
+    const t1 = c, p1 = c.clone().addScaledVector(dir, dist);
+    this.camera.near = Math.min(this.camera.near, Math.max(0.1, dist / 500));
+    this.camera.updateProjectionMatrix();
+    const start = performance.now(), T = 280;
+    const step = () => {
+      const u = Math.min(1, (performance.now() - start) / T), e = u * u * (3 - 2 * u);
+      this.controls.target.lerpVectors(t0, t1, e);
+      this.camera.position.lerpVectors(p0, p1, e);
+      this.controls.update();
+      this.needsFrame = true;
+      if (u < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+    return true;
+  }
+
+  fit() {
+    const b = this.bbox;
+    if (!b || b.isEmpty()) return;
+    const c = new THREE.Vector3();
+    b.getCenter(c);
+    const size = Math.max(b.max.x - b.min.x, b.max.y - b.min.y);
+    this.controls.target.copy(c);
+    const r = this.el.getBoundingClientRect();
+    const k = r.width > 0 && r.height > 0 && r.width < r.height ? r.height / r.width : 1;
+    this.camera.position.set(c.x - size * 0.2, c.y - size * 1.2 * k, c.z + size * 0.85 * k);
+    this.camera.near = Math.max(0.5, size / 2000);
+    this.camera.far = size * 20;
+    this.camera.updateProjectionMatrix();
+    this.scene.fog.near = size * 1.5;
+    this.scene.fog.far = size * 6;
+    this.fitted = true;
+    this.needsFrame = true;
+  }
+
+  setHover(s) {
+    const L = this.app.state.layout, E = this.app.state.result;
+    // cámara de juego: la guía (esfera blanca sobre la pista) solo con «Mostrar guía», y nunca mientras se arrastra el auto
+    const g = this.game, st = this.app.state;
+    const hideInGame = g && g.active && (g.dragging || !(st.game && st.game.showGuide));
+    if (s === null || s === undefined || !L || !E || hideInGame) { this.marker.visible = false; this.needsFrame = true; return; }
+    const r = L.routes[0];
+    const i = Math.min(r.n - 1, Math.round(s / r.ds));
+    this.marker.position.set(r.x[i], r.y[i], E.routes[0].z[i] * this.zExag + 2);
+    this.marker.visible = true;
+    this.needsFrame = true;
+  }
+}
