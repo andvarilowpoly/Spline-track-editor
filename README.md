@@ -1,6 +1,6 @@
 # Track Spline Generator
 
-**Versión 0.90** (se muestra en la barra superior, junto al nombre, y se guarda en cada proyecto como `appVersion`).
+**Versión 0.91** (se muestra en la barra superior, junto al nombre, y se guarda en cada proyecto como `appVersion`).
 
 Aplicación local con interfaz web que convierte un layout 2D de pista (minimapa o trazo a mano) en un spline 3D. Los cruces del layout se resuelven como pasos sobre/bajo nivel. El resto de la pista recibe colinas suaves controladas por un slider. Se exporta como curvas para **Blender** y **3ds Max**, donde se genera la geometría.
 
@@ -15,6 +15,8 @@ Aplicación local con interfaz web que convierte un layout 2D de pista (minimapa
 
 
 **Pinceles del terreno (0.52):** *Pintar subdivisión* tiene *Aumentar subd.* (por defecto: la pincelada tiene (n + 1)² veces más polígonos) o *Disminuir subd.* (la pincelada tiene (n + 1)² veces menos: el terreno queda más simple en esa zona); también vale para la subdivisión de un cerro seleccionado. *Esculpir relieve* tiene los botones *Elevar / hundir* (clic izquierdo eleva, derecho hunde) y **Suavizar**: el pincel no eleva ni hunde, reparte el relieve esculpido bajo él (baja las cimas y rellena los bordes, conservando el volumen); la *Fuerza* marca cuánto suaviza cada toque. Suaviza el relieve esculpido, no el terreno natural.
+**Novedades 0.91:** traducción al inglés completa (Ajustes → Idioma / Language): los paneles de agua (ríos, lagos y cascadas, con sus texturas, mapeado y decoración), los coin stripes y sus monedas, los nodos, los sets de decoración (planos de pie y acostados, también sobre el agua), los mensajes de exportación y de corrección de cruces ya salen en inglés; los nombres de los objetos exportados siguen en español. Manual de uso en inglés en `/manual` (`manual.html`, con índice y buscador).
+
 **Novedades 0.90:** los ríos que son lago (elegido o detectado en *Automático*) se llaman **lago_NN** (numerados aparte) en las pestañas, la tarjeta, el mapa y la exportación; las cascadas siguen como **cascada_NN**. La decoración de los lagos y ríos se ajusta con **deslizadores** (con su número al lado, que admite valores fuera del rango). Nuevo elemento de pista: **coin stripes** (menú «Elementos de pista ▾» o su sección), franjas amarillas que funcionan como los nitro strips (grupos, cantidad, largo, ancho, posición, zonas pintadas, textura propia) con **monedas** encima: se elige su **altura** sobre la pista, su **tamaño** y **cuántas por stripe**. Las monedas van de pie, de cara a la marcha, **giran en la cámara de juego** y se exportan como hijas de su stripe (`coinstripeA-1_moneda_1`…, material `moneda`, pivote al centro).
 
 **Novedades 0.89:** la sección **Agua** ya no tiene controles generales sueltos: el **agua** (textura, capa 2, repetición U / V y segunda capa), el **lecho** (su textura, en la tarjeta al marcar *Lecho*) y las paredes van en la tarjeta de cada río, lago o cascada; sin textura cargada cada uno usa la de fábrica. Los proyectos anteriores copian lo general a cada uno (según sea río, lago o cascada). Los ríos, lagos y cascadas se muestran en **pestañas** (con su tipo y nombre), como los grupos de árboles y los sets de decoración: se ve una tarjeta por vez y un clic en el mapa o en 3D trae su pestaña.

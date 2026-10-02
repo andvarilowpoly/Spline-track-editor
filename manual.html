@@ -1,0 +1,876 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%226%22 fill=%22%23c9761a%22/%3E%3C/svg%3E">
+<title>Track Spline Generator Manual</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a reference manual — sticky contents rail on the left, one readable column of sections on the right; tables carry the parameters. */
+:root{
+  --bg:#f3f5f7; --surface:#ffffff; --ink:#18202b; --muted:#5a6676; --line:#d9dfe6;
+  --accent:#c9761a; --accent-ink:#8a4d0c; --accent-soft:#fbeedd; --kerb:#c8372d; --code-bg:#eef1f5;
+  --display:"Barlow Condensed","Arial Narrow",system-ui,sans-serif;
+  --body:"Atkinson Hyperlegible",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#11161d; --surface:#18202a; --ink:#e6ebf1; --muted:#9aa7b7; --line:#2a3442;
+  --accent:#f2a33a; --accent-ink:#f6b860; --accent-soft:#2a2216; --kerb:#e0574b; --code-bg:#1f2834; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#11161d; --surface:#18202a; --ink:#e6ebf1; --muted:#9aa7b7; --line:#2a3442;
+  --accent:#f2a33a; --accent-ink:#f6b860; --accent-soft:#2a2216; --kerb:#e0574b; --code-bg:#1f2834; color-scheme:dark}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:16px}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+body{background:var(--bg);color:var(--ink);font-family:var(--body);font-size:16px;line-height:1.6;margin:0}
+.wrap{display:grid;grid-template-columns:270px minmax(0,1fr);gap:40px;max-width:1240px;margin:0 auto;padding-inline:24px;padding-block:28px 80px}
+nav.toc{position:sticky;top:calc(env(safe-area-inset-top,0px) + 16px);align-self:start;max-height:calc(100vh - 32px);overflow:auto;padding-right:6px}
+.brand{font-family:var(--display);font-weight:700;font-size:26px;line-height:1.05;letter-spacing:.2px}
+.brand span{color:var(--accent)}
+.ver{font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:4px}
+.kerb{height:6px;margin:14px 0 16px;border-radius:2px;background:repeating-linear-gradient(90deg,var(--kerb) 0 14px,var(--surface) 14px 28px);box-shadow:inset 0 0 0 1px var(--line)}
+.find{width:100%;font:inherit;font-size:14px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink)}
+.find:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.findinfo{font-size:12px;color:var(--muted);min-height:18px;margin:6px 2px 10px}
+nav.toc ol{list-style:none;margin:0;padding:0}
+nav.toc li{margin:0}
+nav.toc a{display:block;color:var(--muted);text-decoration:none;font-size:14px;padding:3px 8px;border-radius:6px;line-height:1.35}
+nav.toc a:hover{color:var(--ink);background:var(--code-bg)}
+nav.toc a.on{color:var(--accent-ink);background:var(--accent-soft);font-weight:700}
+nav.toc .grp{font-family:var(--display);font-size:13px;letter-spacing:1.4px;text-transform:uppercase;color:var(--ink);margin:14px 8px 4px;font-weight:600}
+nav.toc ol ol a{padding-left:20px;font-size:13px}
+main{min-width:0;max-width:820px}
+header.hero{padding-bottom:8px;border-bottom:1px solid var(--line);margin-bottom:8px}
+.eyebrow{font-family:var(--display);text-transform:uppercase;letter-spacing:2px;font-size:14px;color:var(--accent-ink);font-weight:600}
+h1{font-family:var(--display);font-weight:700;font-size:clamp(38px,6vw,56px);line-height:1;margin:6px 0 12px;text-wrap:balance}
+.lede{font-size:18px;color:var(--muted);max-width:62ch;margin:0 0 16px}
+.facts{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:14px;color:var(--muted);margin:0 0 18px;padding:0;list-style:none}
+.facts b{color:var(--ink)}
+section.part{padding-top:26px}
+h2{font-family:var(--display);font-weight:700;font-size:34px;line-height:1.1;margin:22px 0 6px;text-wrap:balance;display:flex;align-items:baseline;gap:12px}
+h2 .no{font-family:var(--mono);font-size:14px;color:var(--accent-ink);font-weight:600;min-width:2.2em}
+h3{font-family:var(--display);font-weight:600;font-size:24px;line-height:1.15;margin:28px 0 6px;text-wrap:balance}
+h4{font-size:15px;margin:18px 0 4px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
+p,li{max-width:68ch}
+p{margin:8px 0}
+ul,ol.steps{padding-left:1.25em;margin:8px 0}
+li{margin:3px 0}
+a{color:var(--accent-ink)}
+.where{font-size:13.5px;color:var(--muted);margin:2px 0 10px}
+.where b{color:var(--ink);font-weight:700}
+code,kbd,.id{font-family:var(--mono);font-size:.86em}
+code{background:var(--code-bg);padding:1px 5px;border-radius:4px}
+kbd{display:inline-block;min-width:1.7em;text-align:center;padding:0 6px;border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;background:var(--surface);line-height:1.5}
+.ui{font-weight:700}
+.tbl{overflow-x:auto;margin:10px 0 14px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14.5px}
+th,td{text-align:left;vertical-align:top;padding:8px 12px;border-bottom:1px solid var(--line)}
+tr:last-child td{border-bottom:0}
+th{font-family:var(--display);font-weight:600;font-size:14px;letter-spacing:.8px;text-transform:uppercase;color:var(--muted);background:var(--code-bg)}
+td:first-child{font-weight:700;width:34%}
+td .u{display:inline-block;font-family:var(--mono);font-weight:400;font-size:12px;color:var(--muted);margin-left:4px}
+.note{border-left:4px solid var(--accent);background:var(--accent-soft);padding:10px 14px;border-radius:0 8px 8px 0;margin:12px 0;max-width:68ch}
+.note b{color:var(--accent-ink)}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:12px 0}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-width:0}
+.tile h4{margin:0 0 4px;color:var(--ink);text-transform:none;letter-spacing:0;font-size:16px}
+.tile p{margin:0;font-size:14.5px;color:var(--muted)}
+ol.steps{counter-reset:s;list-style:none;padding-left:0}
+ol.steps>li{counter-increment:s;position:relative;padding-left:42px;margin:10px 0}
+ol.steps>li::before{content:counter(s);position:absolute;left:0;top:1px;width:28px;height:28px;border-radius:50%;background:var(--ink);color:var(--bg);font-family:var(--display);font-weight:700;font-size:16px;display:flex;align-items:center;justify-content:center}
+.cols.four{grid-template-columns:repeat(4,minmax(0,1fr))}
+@media (max-width:700px){.cols.four{grid-template-columns:repeat(2,minmax(0,1fr))}}
+mark{background:var(--accent-soft);color:inherit;box-shadow:0 0 0 2px var(--accent-soft);border-radius:2px}
+.hidden-by-find{display:none}
+footer{margin-top:50px;padding-top:16px;border-top:1px solid var(--line);font-size:13px;color:var(--muted)}
+.mtoggle{display:none}
+@media (max-width:900px){
+  .wrap{grid-template-columns:minmax(0,1fr);gap:16px;padding-inline:16px}
+  nav.toc{position:static;max-height:none;border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:12px}
+  nav.toc .list{display:none}
+  nav.toc.open .list{display:block}
+  .mtoggle{display:inline-block;font:inherit;font-size:14px;margin-top:6px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
+  td:first-child{width:40%}
+  h2{font-size:28px}
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<nav class="toc" id="toc" aria-label="Contents">
+  <div class="brand">Track Spline <span>Generator</span></div>
+  <div class="ver">User manual · version 0.90</div>
+  <div class="kerb" aria-hidden="true"></div>
+  <label for="find" class="eyebrow" style="font-size:12px">Search the manual</label>
+  <input id="find" class="find" type="search" placeholder="e.g. tunnel, seed, shadow…" autocomplete="off">
+  <div class="findinfo" id="findinfo"></div>
+  <button class="mtoggle" id="mtoggle" type="button" aria-expanded="false">Show contents</button>
+  <div class="list">
+  <div class="grp">Start here</div>
+  <ol>
+    <li><a href="#overview">What it does</a></li>
+    <li><a href="#start">Getting started</a></li>
+    <li><a href="#concepts">Key concepts</a></li>
+    <li><a href="#tour">The screen</a></li>
+    <li><a href="#search">Search</a></li>
+    <li><a href="#settings">Settings</a></li>
+  </ol>
+  <div class="grp">Tools</div>
+  <ol>
+    <li><a href="#maptools">Map toolbar</a></li>
+    <li><a href="#editpoints">Edit points</a></li>
+    <li><a href="#brushes">Brush tools</a></li>
+    <li><a href="#view3d">3D view</a></li>
+    <li><a href="#profile">Elevation profile</a></li>
+    <li><a href="#warnings">Warnings panel</a></li>
+  </ol>
+  <div class="grp">Sidebar sections</div>
+  <ol>
+    <li><a href="#g-input">Input</a></li>
+    <li><a href="#g-shape">Track shape</a></li>
+    <li><a href="#g-look">Track appearance</a></li>
+    <li><a href="#g-terrain">Terrain, hills and water</a></li>
+    <li><a href="#g-veg">Vegetation and decoration</a></li>
+    <li><a href="#g-game">Game</a></li>
+  </ol>
+  <div class="grp">Play and deliver</div>
+  <ol>
+    <li><a href="#gamecam">Game camera</a></li>
+    <li><a href="#saving">Saving and autosave</a></li>
+    <li><a href="#export">Exporting</a></li>
+    <li><a href="#keys">Keyboard shortcuts</a></li>
+    <li><a href="#tips">Tips</a></li>
+  </ol>
+  </div>
+</nav>
+
+<main id="main">
+<header class="hero">
+  <div class="eyebrow">User manual</div>
+  <h1>Track Spline Generator</h1>
+  <p class="lede">Turn a 2D sketch or a minimap image into a game-ready 3D race track, with terrain, hills, tunnels, water, vegetation and gameplay items, and export it to your engine.</p>
+  <ul class="facts">
+    <li><b>Units</b> meters, Z up</li>
+    <li><b>Exports</b> GLB, FBX, Blender, 3ds Max, JSON, OBJ</li>
+    <li><b>Online</b> trackspline.vercel.app</li>
+  </ul>
+</header>
+
+<section class="part" id="overview">
+<h2><span class="no">01</span>What it does</h2>
+<p>Track Spline Generator builds a racing track from a 2D layout and dresses the scene around it. You give it a shape (a freehand stroke, a minimap image or one of the samples). It fits a smooth spline, works out heights, crossings and banking, and builds the road mesh. Then you add terrain, hills with tunnels, rivers and lakes, trees, grass, props, shadows, signs and gameplay items. When you are done, you export everything as one 3D scene for your engine.</p>
+<div class="cols four">
+  <div class="tile"><h4>Shape</h4><p>Draw, trace an image or start from a sample. Edit control points, loops, helixes, fixed-radius curves and shortcuts.</p></div>
+  <div class="tile"><h4>Height</h4><p>Automatic hills with hard limits on grade and vertical radius, or exact keyframes you set yourself.</p></div>
+  <div class="tile"><h4>Scene</h4><p>Terrain, hills and tunnels, water, vegetation, decoration sets, shadow planes, signs and track items.</p></div>
+  <div class="tile"><h4>Deliver</h4><p>Drive it with the game camera, then export GLB or FBX with colliders, nodes, triggers and named objects.</p></div>
+</div>
+<p>Almost every change rebuilds the track and the scene immediately, and <kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes each gesture.</p>
+</section>
+
+<section class="part" id="start">
+<h2><span class="no">02</span>Getting started</h2>
+<h3>Opening the app</h3>
+<ul>
+  <li><b>Online:</b> open <code>trackspline.vercel.app</code> in Chrome, Edge or Firefox. Nothing to install.</li>
+  <li><b>Locally:</b> in the project folder run <code>node server.js</code> (Node 18 or newer) and open <code>http://localhost:5173</code>. Use <code>PORT=5174 node server.js</code> for another port, or double-click <code>iniciar.sh</code>, <code>iniciar.command</code> or <code>iniciar.bat</code>. With the local server, autosave can also write copies to the server folder.</li>
+</ul>
+<h3>Your first track in ten steps</h3>
+<ol class="steps">
+  <li><b>Get a shape.</b> Choose <span class="ui">Input → Sample</span>, paste a minimap with <kbd>Ctrl</kbd>+<kbd>V</kbd>, use <span class="ui">Load image…</span>, or pick <span class="ui">Draw</span> and sketch on the map.</li>
+  <li><b>Set the scale.</b> In <span class="ui">Layout</span>, set <span class="ui">Lap length</span> (600–1500 m suits karts) and <span class="ui">Track width</span> (10–16 m).</li>
+  <li><b>Place the finish line</b> with <span class="ui">Move the finish line…</span> and choose the direction with <span class="ui">Reverse direction</span>.</li>
+  <li><b>Refine the shape</b> with <span class="ui">Edit points</span>: drag points, smooth stretches, set exact curve radii, add loops or a helix.</li>
+  <li><b>Tune the heights</b> in <span class="ui">Elevation</span>: amount of hills, seed and maximum grade. Check the elevation profile under the map.</li>
+  <li><b>Add sections</b> where needed: bridges with pillars or trenches with walls.</li>
+  <li><b>Generate the scene</b> with <span class="ui">Generate terrain</span> and <span class="ui">Generate trees and decoration</span> (3D view toolbar).</li>
+  <li><b>Paint the landscape</b>: hills (tunnels appear by themselves), water, sculpted relief.</li>
+  <li><b>Add gameplay</b>: nitro strips, coin stripes, turbo pads, puddles, signs, triggers and nodes.</li>
+  <li><b>Drive and deliver</b>: test with <span class="ui">Game camera</span>, check the warnings, then <span class="ui">Save</span> the project and <span class="ui">Export → Scene (.glb)</span>.</li>
+</ol>
+</section>
+
+<section class="part" id="concepts">
+<h2><span class="no">03</span>Key concepts</h2>
+<div class="tbl"><table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td>Main route</td><td>The track itself. It has a racing direction; <code>s</code> is the distance traveled from the finish line (s = 0).</td></tr>
+<tr><td>Shortcut (alternative route)</td><td>A route that leaves the main track and joins it again. It has its own width, textures and edges.</td></tr>
+<tr><td>Lap length</td><td>Sets the scale of everything. The drawn shape is stretched so one lap measures that many meters.</td></tr>
+<tr><td>Control points</td><td>Editable points the spline passes through exactly. They appear when you use <span class="ui">Edit points</span>. A point can have a pinned height (orange in the profile).</td></tr>
+<tr><td>Section</td><td>Part of the main route with its own settings: <b>Track</b> (terrain adapts), <b>Bridge</b> (terrain stays, pillars appear) or <b>Trench</b> (a cutting with walls).</td></tr>
+<tr><td>Crossing</td><td>Where the track passes over itself or a shortcut. The app decides which pass goes on top and keeps the clearance.</td></tr>
+<tr><td>Left and right</td><td>Always measured by the racing direction: dirt roads, barriers, signs, tree sides. Reversing the direction rebuilds them.</td></tr>
+<tr><td>Placeholders</td><td>Cones, cubes and planes you see in the editor stand in for your own art. Load FBX or GLB models to replace them.</td></tr>
+<tr><td>Canvas units</td><td>Brush strokes and points are stored in 2D map pixels and converted to meters with the scale. Change <span class="ui">Lap length</span> before painting hills, water and decoration.</td></tr>
+</table></div>
+</section>
+
+<section class="part" id="tour">
+<h2><span class="no">04</span>The screen</h2>
+<div class="cols">
+  <div class="tile"><h4>Top bar</h4><p>New, Open, Save, Undo, Settings, Export, the project name and the search box.</p></div>
+  <div class="tile"><h4>Sidebar</h4><p>All parameters, in groups: Input, Track shape, Track appearance, Terrain, Vegetation and decoration, Game.</p></div>
+  <div class="tile"><h4>2D map</h4><p>The layout from above, with its toolbar of tools and brushes.</p></div>
+  <div class="tile"><h4>3D view</h4><p>The live scene, with display toggles, the triangle counter and the game camera.</p></div>
+  <div class="tile"><h4>Elevation profile</h4><p>Height along the lap, Z(s), with its own toolbar.</p></div>
+  <div class="tile"><h4>Warnings</h4><p>Grades out of range, missing clearance, tight hairpins and other problems.</p></div>
+</div>
+<h3>Top bar</h3>
+<div class="tbl"><table>
+<tr><th>Button</th><th>What it does</th></tr>
+<tr><td>New</td><td>Starts from scratch. Asks before replacing a track you have worked on.</td></tr>
+<tr><td>Open</td><td>Opens a <code>.tsg.json</code> project (you can pick several files).</td></tr>
+<tr><td>Save</td><td>Downloads the project as <code>&lt;name&gt;.tsg.json</code>. It contains everything, including textures and models.</td></tr>
+<tr><td>Undo</td><td>Undoes the last gesture (<kbd>Ctrl</kbd>+<kbd>Z</kbd>).</td></tr>
+<tr><td>Settings</td><td>Language, text size, keyboard shortcuts, autosave and windows. See <a href="#settings">Settings</a>.</td></tr>
+<tr><td>Export</td><td>Opens the export window. See <a href="#export">Exporting</a>.</td></tr>
+<tr><td>Project name</td><td>The name used when saving and for autosave copies.</td></tr>
+<tr><td>Search</td><td>Finds any tool or parameter. See <a href="#search">Search</a>.</td></tr>
+</table></div>
+<h3>Sidebar panels</h3>
+<ul>
+  <li>Each panel folds with its arrow <b>▾ / ▸</b>. Cards inside panels (sections, rivers, tunnels, sets) fold too.</li>
+  <li>The <b>book icon</b> next to a panel title shows instructions for that panel. The <b>?</b> next to a parameter explains what it does.</li>
+  <li><b>⧉</b> undocks a panel as a floating window; <b>⇥</b> docks it in the right sidebar. <span class="ui">Settings → Dock all windows</span> puts them back.</li>
+  <li>Clicking an object in the map or the 3D view (a hill, a river, a section, an item, a tree) opens its card in the sidebar.</li>
+</ul>
+</section>
+
+<section class="part" id="search">
+<h2><span class="no">05</span>Search</h2>
+<p class="where">Top bar · <kbd>Ctrl</kbd>+<kbd>K</kbd> or <kbd>/</kbd></p>
+<p>The search box finds tools, buttons and parameters by name or by words from their help text. It looks inside folded panels and closed windows too.</p>
+<ul>
+  <li>Type a few letters, for example <code>clearance</code>, <code>seed</code> or <code>tunnel</code>. Results show where each item lives.</li>
+  <li>Use the arrow keys and <kbd>Enter</kbd>, or click a result. The app opens the panel, scrolls to the control and highlights it.</li>
+  <li>Tools are activated directly; windows (Export, Settings) open; <span class="ui">Game camera</span> starts driving.</li>
+  <li><kbd>Esc</kbd> closes the results.</li>
+</ul>
+</section>
+
+<section class="part" id="settings">
+<h2><span class="no">06</span>Settings</h2>
+<p class="where">Top bar · <b>Settings</b>. Stored in this browser, not in the project.</p>
+<div class="tbl"><table>
+<tr><th>Setting</th><th>What it does</th></tr>
+<tr><td>Language</td><td>Spanish or English, applied instantly. Exported object names stay the same in both languages.</td></tr>
+<tr><td>Text size<span class="u">80–150 %</span></td><td>Scales all interface text. <span class="ui">Reset (100 %)</span> goes back.</td></tr>
+<tr><td>Keyboard shortcuts</td><td>Click an action's key and press the new key or combination (Ctrl, Alt, Shift + key); <kbd>Esc</kbd> cancels. A key taken from another action is removed there. <b>Right-click any button</b> to give it its own shortcut. <span class="ui">Reset default shortcuts</span> restores them.</td></tr>
+<tr><td>Autosave</td><td>Saves a copy every few minutes when something changed, keeping the newest copies per project. Set the interval and how many copies to keep. See <a href="#saving">Saving and autosave</a>.</td></tr>
+<tr><td>Windows</td><td>Panels can float (⧉) or dock right (⇥). <span class="ui">Dock all windows</span> returns them to the sidebar.</td></tr>
+</table></div>
+</section>
+
+<section class="part" id="maptools">
+<h2><span class="no">07</span>Map toolbar</h2>
+<p class="where">Above the 2D map. Only one tool is active; <kbd>Esc</kbd> goes back to Navigate.</p>
+<div class="tbl"><table>
+<tr><th>Tool</th><th>What it does</th></tr>
+<tr><td>Navigate</td><td>Pan and zoom (wheel, right button). Click objects to select them and drag items, the reference image or a 3D model outline.</td></tr>
+<tr><td>Edit points</td><td>Turns the route into control points you can move, add and delete. Opens its own sub-toolbar. See <a href="#editpoints">Edit points</a>.</td></tr>
+<tr><td>Draw</td><td>Draw the main route freehand. With <span class="ui">Extend the existing track</span> (on by default) a stroke continues the track from an open end, or redraws a stretch if it starts and ends on the track. Unchecked, it draws a new track. <span class="ui">Drawing smoothing</span> (0–10) evens out a shaky hand.</td></tr>
+<tr><td>Draw shortcut</td><td>Draw an alternative route that starts and ends on the main track.</td></tr>
+<tr><td>Reference</td><td>Move the reference image (drag it) and scale it (drag its purple corner).</td></tr>
+<tr><td>Hills</td><td>Paint hills. Covering the track creates a tunnel. See <a href="#brushes">Brush tools</a>.</td></tr>
+<tr><td>Paint subdivision</td><td>Paint areas of terrain (or of the selected hill) that get more polygons.</td></tr>
+<tr><td>Sculpt relief</td><td>Raise (left click) or lower (right click) the terrain, on the map or in 3D.</td></tr>
+<tr><td>Smooth track</td><td>Paint over the track to smooth the points under the brush, without selecting anything. Each pass smooths more.</td></tr>
+<tr><td>Water</td><td>Paint rivers and lakes; strokes that start on a hill make a waterfall.</td></tr>
+<tr><td>Track items ▾</td><td>Menu to add <span class="ui">Nitro strips</span>, <span class="ui">Coin stripes</span>, <span class="ui">Turbo pads</span>, <span class="ui">Puddles</span>, <span class="ui">Curve signage</span> and <span class="ui">Nodes</span>.</td></tr>
+<tr><td>Fit</td><td>Frames the whole layout in the map.</td></tr>
+<tr><td>Raw trace</td><td>Shows the raw traced line from the image or drawing under the spline, to compare.</td></tr>
+</table></div>
+</section>
+
+<section class="part" id="editpoints">
+<h2><span class="no">08</span>Edit points</h2>
+<p class="where">Map toolbar · <b>Edit points</b>. Double-clicking the track from any tool enters it at the nearest point.</p>
+<h3>Working with points</h3>
+<ul>
+  <li><b>Move:</b> drag a point on the map, or click its sphere in 3D and use the gizmo (<span class="ui">Free</span>, <span class="ui">XY plane</span>, <span class="ui">Z only</span>).</li>
+  <li><b>Add:</b> double-click the track. <b>Delete:</b> right-click, <kbd>Alt</kbd>+click or <kbd>Del</kbd>.</li>
+  <li><b>Select several:</b> <kbd>Shift</kbd>+drag draws a box; <kbd>Ctrl</kbd>+click adds or removes one; <kbd>Shift</kbd>+click takes every point between the last one and this one. Works on the map, the profile and the 3D view.</li>
+  <li><b>Open</b> (checkbox): deleting a point of a closed circuit leaves it open. A section between the two ends closes it again.</li>
+</ul>
+<h3>Sub-toolbar</h3>
+<div class="tbl"><table>
+<tr><th>Control</th><th>What it does</th></tr>
+<tr><td>Vertex <kbd>1</kbd> / Segment <kbd>2</kbd></td><td>Select points, or select stretches between two points (click on the track). Segment ends are shared, so neighbors adapt.</td></tr>
+<tr><td>Move <kbd>W</kbd> · Rotate <kbd>E</kbd> · Scale <kbd>R</kbd></td><td>Transform the selection with the gizmo or by dragging. Rotate snaps to 5° with Shift. Scale works uniformly or per X / Y axis. A number field takes an exact value.</td></tr>
+<tr><td>Scale: in plan (XY) / the height (Z)</td><td>In Direct elevation mode, scale the selection's heights from the line between its ends, the average or the lowest point.</td></tr>
+<tr><td>Line</td><td>Aligns 2 or more points in a straight line: <span class="ui">Between ends</span>, <span class="ui">X axis</span>, <span class="ui">Y axis</span> or at an <span class="ui">Angle</span> that rotates the selection live.</td></tr>
+<tr><td>Smooth</td><td>With 3 or more consecutive points selected, the slider removes jitter (ends don't move). <span class="ui">Also heights</span> smooths pinned heights; <span class="ui">Even out points</span> spaces them evenly.</td></tr>
+<tr><td>Radius</td><td>Opens <span class="ui">Fixed-radius curve</span> (Spline panel): the selected points become a perfect arc. See below.</td></tr>
+<tr><td>Helix</td><td>The track turns around a center, climbing or dropping each turn. Set <span class="ui">Radius</span>, <span class="ui">Turns</span>, <span class="ui">Start / end radius</span> (a spiral), <span class="ui">Z per turn</span>, <span class="ui">Up / Down</span> and the side, then <span class="ui">Add helix</span>. Select the helix later to edit it live.</td></tr>
+<tr><td>Loop</td><td>The track makes one or more turns over itself and crosses over. Set <span class="ui">Turns</span>, <span class="ui">Z separation</span>, <span class="ui">Radius</span> (0 = automatic) and its <span class="ui">max.</span>, and the side, then <span class="ui">Add loop</span>. Editable live afterwards.</td></tr>
+<tr><td>Fork</td><td>Creates a shortcut from the selection (see <span class="ui">Fork the track</span>).</td></tr>
+<tr><td>Section</td><td>Turns the selected points into a section of the type chosen in <span class="ui">Sections</span>.</td></tr>
+</table></div>
+<h3>Fixed-radius curve</h3>
+<p class="where">Sidebar · Track shape · <b>Spline</b></p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Radius<span class="u">m</span></td><td>The curve radius. The selected points sit on a circle of this radius and the track rebuilds as you drag.</td></tr>
+<tr><td>Transition (neighboring points)<span class="u">1–6</span></td><td>How many neighbors on each side are rearranged so the curve enters and exits smoothly.</td></tr>
+<tr><td>Apply radius / Clear selection</td><td>Apply a typed radius; finish and drop the selection.</td></tr>
+</table></div>
+<h3>Spline and fork</h3>
+<div class="tbl"><table>
+<tr><th>Control</th><th>What it does</th></tr>
+<tr><td>More points / Fewer points</td><td>Redistributes the control points more densely or more sparsely.</td></tr>
+<tr><td>Discard changes</td><td>Goes back to the original traced or drawn route.</td></tr>
+<tr><td>Fork side</td><td>Where the new route goes, by racing direction. <span class="ui">Through the middle</span> splits the separation between both routes.</td></tr>
+<tr><td>Maximum separation<span class="u">m</span></td><td>Distance between the track and the new route halfway along the stretch.</td></tr>
+<tr><td>Fork selection</td><td>Creates the shortcut from the first to the last selected point.</td></tr>
+</table></div>
+</section>
+
+<section class="part" id="brushes">
+<h2><span class="no">09</span>Brush tools</h2>
+<p>Brushes share some rules: <kbd>[</kbd> and <kbd>]</kbd> shrink and grow the brush, <kbd>Alt</kbd> or right click erases, and holding <kbd>Shift</kbd> navigates without painting. Each brush shows its options in a bar under the map toolbar.</p>
+<div class="tbl"><table>
+<tr><th>Brush</th><th>Options in its bar</th></tr>
+<tr><td>Hills</td><td><span class="ui">Brush</span> size, <span class="ui">Height</span>, <span class="ui">Gentle hill / Rock wall</span>, <span class="ui">Flat top</span>, <span class="ui">Erase</span>. Painting over an existing hill paints a new one on top; with <kbd>Ctrl</kbd> it enlarges (or erases) the original.</td></tr>
+<tr><td>Paint subdivision</td><td>Extra subdivisions for new strokes. Each stroke keeps its own level, so areas can have different detail. The polygon cap still applies.</td></tr>
+<tr><td>Sculpt relief</td><td><span class="ui">Strength</span>, <span class="ui">Raise / lower</span> or <span class="ui">Smooth</span> mode, <span class="ui">More detail in sculpting</span>. The brush curve is set in <span class="ui">Relief and subdivision</span>.</td></tr>
+<tr><td>Smooth track</td><td><span class="ui">Strength</span> per touch and <span class="ui">Also heights</span>.</td></tr>
+<tr><td>Water</td><td><span class="ui">Brush</span>, <span class="ui">Line</span> (straight segments, less geometry; start at a line's end to chain) or <span class="ui">Smooth</span> (rounds the outline); round or square line ends; <span class="ui">Stabilize</span> (the brush trails the cursor for even strokes); <span class="ui">Resting</span> or <span class="ui">Carved</span>; depth, wall type and wall density for new rivers. Starting on a hill makes a waterfall; starting on a river extends or forks it.</td></tr>
+</table></div>
+</section>
+
+<section class="part" id="view3d">
+<h2><span class="no">10</span>3D view</h2>
+<div class="tbl"><table>
+<tr><th>Control</th><th>What it does</th></tr>
+<tr><td>Exaggerate Z</td><td>Stretches heights in the view only, to read the relief. The export uses real heights.</td></tr>
+<tr><td>Fit</td><td>Frames the scene. <kbd>F</kbd> frames the selection.</td></tr>
+<tr><td>Wireframe</td><td>Draws every triangle on top of the scene, with its color and opacity (<kbd>F3</kbd>).</td></tr>
+<tr><td>Triggers · Collisions · Nodes</td><td>Show or hide triggers, collision geometry and nodes. <span class="ui">Collisions</span> is greyed out until collision geometry exists.</td></tr>
+<tr><td>Generate terrain</td><td>Turns on the terrain with default values (keeps yours if it is already on) and opens its panel.</td></tr>
+<tr><td>Generate trees and decoration</td><td>Turns on trees with default values and opens their panel.</td></tr>
+<tr><td>Game camera</td><td>A car drives the track. See <a href="#gamecam">Game camera</a>.</td></tr>
+<tr><td>Triangle counter</td><td>Bottom left: triangles per part (track, edges, terrain, hills, water, trees, grass, decoration, shadows) and the total.</td></tr>
+</table></div>
+<p>Drag to orbit, right-drag to pan, wheel to zoom. Click objects to select them; with Edit points active, control points appear as spheres with a gizmo.</p>
+</section>
+
+<section class="part" id="profile">
+<h2><span class="no">11</span>Elevation profile</h2>
+<p class="where">Under the map. The chart shows height Z along the lap s; the little car marks the game camera position (drag it to move).</p>
+<div class="tbl"><table>
+<tr><th>Control</th><th>What it does</th></tr>
+<tr><td>Automatic / Direct</td><td>Shortcut to the elevation mode. <b>Automatic</b>: the optimizer builds the heights and pinned heights are requests. <b>Direct</b>: each orange point is a keyframe the curve passes through exactly.</td></tr>
+<tr><td>Fit</td><td>Shows the whole lap again. On the chart: wheel = horizontal zoom, Shift + wheel = vertical zoom, middle button = pan.</td></tr>
+<tr><td>Flatten</td><td>Sets the selected points to their average height, strictly flat between the first and the last.</td></tr>
+<tr><td>Smooth heights<span class="u">0–100</span></td><td>Smooths the selected heights with the ends fixed.</td></tr>
+<tr><td>Section profile</td><td>Pick a stretch (drag over the track on the map, or Shift on the chart) and draw how its height should vary. Its points take that shape and stay editable.</td></tr>
+<tr><td>Edit only this point</td><td>When on, changing one point's height affects only its close neighbors.</td></tr>
+</table></div>
+<p>With <span class="ui">Edit points</span>: drag a point vertically to pin its height (◆), double-click to add a point at that height, right-click or Alt-click to make it automatic again. The status line shows lap length, height change, maximum grade, crest radius, crossings and shortcuts.</p>
+</section>
+
+<section class="part" id="warnings">
+<h2><span class="no">12</span>Warnings panel</h2>
+<p>Under the profile. <b>Errors</b> (red) and <b>warnings</b> list problems with their position s, such as a grade above the maximum, a vertical radius below the minimum, missing clearance at a crossing, or a hairpin so tight the mesh would cross itself. Click one to jump there. <span class="ui">Delete warnings</span> (trash icon) hides the current ones; new or different ones still appear. A clean track shows "No problems".</p>
+</section>
+
+<section class="part" id="g-input">
+<h2><span class="no">13</span>Input</h2>
+<h3>Input</h3>
+<p>Where the track shape comes from.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Sample</td><td>Loads a ready-made layout: oval with chicane, figure 8, loop over a tunnel, trefoil stadium, circuit with shortcut, star.</td></tr>
+<tr><td>Load image…</td><td>Loads a minimap or sketch and traces it automatically. You can also paste an image with <kbd>Ctrl</kbd>+<kbd>V</kbd> (<kbd>⌘</kbd>+<kbd>V</kbd> on Mac).</td></tr>
+<tr><td>Threshold<span class="u">auto / 1–254</span></td><td>Brightness that separates track and background. <b>Auto</b> tries several ways and keeps the one that gives the cleanest circuit; untick it to set the value yourself.</td></tr>
+<tr><td>Track in the image</td><td>How the track is drawn: <span class="ui">Detect automatically</span>, <span class="ui">Track with outline</span> (dark outline, light fill), <span class="ui">Light track on dark background</span>, <span class="ui">Dark track on light background</span> or <span class="ui">Only the lightest fill</span>.</td></tr>
+<tr><td>Image opacity<span class="u">%</span></td><td>Transparency of the image on the map. Visual only.</td></tr>
+<tr><td>Trace image</td><td>Traces the image again with the current mode and threshold. Replaces the current layout.</td></tr>
+</table></div>
+<div class="note"><b>Shortcuts in the image</b> (a second line that splits and rejoins) are detected and become alternative routes.</div>
+<h3>Reference image</h3>
+<p>An image you only trace over by hand. It is never traced automatically.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Load reference image… / Remove</td><td>Adds or removes the image. With the Reference tool you can also paste it with Ctrl+V; <kbd>Del</kbd> removes it.</td></tr>
+<tr><td>Opacity · Scale (%)</td><td>Transparency and size. Drag its lower right corner with the Reference tool to scale.</td></tr>
+<tr><td>Show · Above the track</td><td>Hide it, or draw it over the track instead of under.</td></tr>
+</table></div>
+<h3>3D reference model</h3>
+<p>Import an FBX or GLB (for example an older track from your game) to compare. It is a single object: you can move it, not edit it, and it is not exported.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Import FBX / GLB… · Remove</td><td>Loads or removes the model.</td></tr>
+<tr><td>Visible · Outline on the map · Lock</td><td>Display options; Lock prevents moving it by accident.</td></tr>
+<tr><td>Select and move · Gizmo in the 3D view</td><td>Move it with the gizmo or by dragging its outline on the map.</td></tr>
+<tr><td>Center on the track · Position from file</td><td>Snap it to the track center or back to the file's own position.</td></tr>
+<tr><td>Position (m) X, Y, Z · Rotation °</td><td>Exact placement.</td></tr>
+<tr><td>Scale · File units · File up axis</td><td>Fix size and orientation of files made in other programs.</td></tr>
+<tr><td>Look · Opacity</td><td>Flat color, original materials or wireframe, and transparency.</td></tr>
+</table></div>
+</section>
+
+<section class="part" id="g-shape">
+<h2><span class="no">14</span>Track shape</h2>
+<h3>Layout</h3>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Lap length<span class="u">m</span></td><td>Real length of a lap. Sets the scale of everything: width, grades and heights are measured at this scale.</td></tr>
+<tr><td>Track width<span class="u">m</span></td><td>Road width. Used by the mesh, the crossing clearance and the hairpin warnings.</td></tr>
+<tr><td>Use width measured in the image</td><td>Takes each stretch's width from the image (wide straights, narrow stretches).</td></tr>
+<tr><td>Detail<span class="u">m between control points</span></td><td>Fewer meters follow the trace more faithfully; more meters give cleaner curves.</td></tr>
+<tr><td>Trace smoothing</td><td>Smooths the raw trace before fitting the spline. Raise it if the layout comes out wavy.</td></tr>
+<tr><td>Closed circuit</td><td>Laps, or an open route from start to finish.</td></tr>
+<tr><td>Reverse direction</td><td>Reverses the racing direction. Left and right, signs and river flow follow it.</td></tr>
+</table></div>
+<h3>Spline</h3>
+<p>Point density, fixed-radius curves and forks. Described under <a href="#editpoints">Edit points</a>.</p>
+<h3>Sections</h3>
+<p>A section is part of the main route with its own settings. With Edit points, select consecutive points and press <span class="ui">Create section</span> (or <span class="ui">Section</span> in the sub-toolbar).</p>
+<div class="tbl"><table>
+<tr><th>Type</th><th>Behavior</th></tr>
+<tr><td>Track</td><td>The terrain adapts as on the rest of the track. Takes everything from the main track; you can change width, lateral offset and textures.</td></tr>
+<tr><td>Bridge</td><td>The terrain does not adapt (natural relief stays under it) and pillars appear where it is raised. <span class="ui">New bridge width</span> sets its width.</td></tr>
+<tr><td>Trench</td><td>Like Track, but lowering its points opens a cutting with <b>smooth</b> walls (a mesh extruded from the track edge, with a top) or <b>natural</b> walls (the terrain in rock, with a slope).</td></tr>
+</table></div>
+<h4>Section card</h4>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Type · Width · Same width as the track</td><td>Change the type later, or give it its own width.</td></tr>
+<tr><td>Lateral offset · ⇤ Left · Center · Right ⇥</td><td>Shift the section sideways, for a wider road on one side.</td></tr>
+<tr><td>Floor material</td><td>Track texture or wood (bridges), or your own texture.</td></tr>
+<tr><td>Transition · Sections on each side</td><td>Optional transition textures at the ends (start and end, "same as start", flips).</td></tr>
+<tr><td>Dirt road · Crash barrier</td><td>Like the track, or its own on each side.</td></tr>
+<tr><td>Walls (trench)</td><td><span class="ui">Smooth (extruded from track)</span> or <span class="ui">Natural (terrain)</span>.</td></tr>
+<tr><td>Wall slope (trench)</td><td>Angle of each wall drawn on a small cross-section chart. Smooth walls go from 45° to 135° (over 90° overhangs the road); natural ones from 45° to 85°. <span class="ui">Same angle on both</span> links them.</td></tr>
+<tr><td>Wall width · Outer faces · Wall density</td><td>Top width of smooth walls; show, hide buried or hide all outer faces; extra subdivisions.</td></tr>
+<tr><td>Rock: Style · Roughness · Rock size</td><td>Natural walls: irregular, sharp (ridges) or layered (strata).</td></tr>
+<tr><td>Textures and mapping</td><td>Inner face, top and outer face (smooth) or rock (natural), with repetition X / Y and fit to height.</td></tr>
+</table></div>
+<p>General trench wall textures sit at the end of the panel; each card can override them.</p>
+<h3>Alternative routes</h3>
+<p>Shortcuts traced from the image, drawn with <span class="ui">Draw shortcut</span> or created with <span class="ui">Fork</span>. Each one has a card:</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Own width · Width</td><td>A width different from the main track.</td></tr>
+<tr><td>Junction smoothness<span class="u">×0.2–2</span></td><td>Length of the tangent curve where it leaves and rejoins: less turns sooner, more is a wider curve.</td></tr>
+<tr><td>Track width at exit and arrival · Automatic junction</td><td>How the shortcut blends into the main road.</td></tr>
+<tr><td>Track material · Dirt road · Barrier</td><td>Its own textures and edges.</td></tr>
+<tr><td>⇄ · ✕</td><td>Reverse its direction; delete it.</td></tr>
+</table></div>
+<h3>Elevation</h3>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Automatic / Direct</td><td>Optimizer with hard limits, or exact keyframes.</td></tr>
+<tr><td>Generate automatic heights</td><td>Runs the optimizer once and keeps its result as generated keyframes (whole track or <span class="ui">Only on the selection</span>; <span class="ui">Don't touch my heights</span> keeps pinned points).</td></tr>
+<tr><td>Fix crossings</td><td>Raises and lowers passes that lack clearance.</td></tr>
+<tr><td>Hills<span class="u">0–100 %</span></td><td>Amount of random hills. 0 = flat. Crossings are solved anyway.</td></tr>
+<tr><td>Hills per lap</td><td>Roughly how many undulations a lap has.</td></tr>
+<tr><td>Maximum amplitude<span class="u">m</span></td><td>Hill height when Hills is at 100 %.</td></tr>
+<tr><td>Minimum wavelength<span class="u">m</span></td><td>Shortest undulation: higher gives long gentle hills, lower gives short bumps.</td></tr>
+<tr><td>Seed · Random</td><td>Defines the hill shape; the same seed always gives the same profile.</td></tr>
+<tr><td>Smoothing</td><td>How round the hills are.</td></tr>
+<tr><td>Maximum grade<span class="u">%</span></td><td>Hard limit up or down (10 % by default). The optimizer never exceeds it.</td></tr>
+<tr><td>Min. vertical radius at crests / valleys<span class="u">m</span></td><td>Larger crests keep the kart on the ground; larger valleys soften compression.</td></tr>
+<tr><td>Flat on each side of the finish line<span class="u">m</span></td><td>Flat stretch for the starting grid.</td></tr>
+</table></div>
+<h3>Crossings</h3>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Clearance under the bridge<span class="u">m</span></td><td>Space between the lower pass and the deck, at every crossing.</td></tr>
+<tr><td>Deck thickness<span class="u">m</span></td><td>Added to the clearance.</td></tr>
+<tr><td>Default type</td><td><span class="ui">Bridge</span> (upper pass rises), <span class="ui">Tunnel</span> (lower pass drops) or <span class="ui">Mixed</span> (half each).</td></tr>
+<tr><td>Crossing list</td><td>Each crossing is a numbered circle on the map. Click it to see its clearance, swap which pass goes over (⇅) and set its type. Hand-edited heights near a crossing win (purple circle).</td></tr>
+</table></div>
+<h3>Banking</h3>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Bank curves</td><td>Tilts the road toward the inside of curves.</td></tr>
+<tr><td>Maximum banking<span class="u">°</span></td><td>Largest side tilt.</td></tr>
+<tr><td>Design speed<span class="u">km/h</span></td><td>Speed used to work out how much each curve needs.</td></tr>
+</table></div>
+</section>
+
+<section class="part" id="g-look">
+<h2><span class="no">15</span>Track appearance</h2>
+<h3>Track texture</h3>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Load texture… · Default</td><td>Your asphalt texture, or the built-in one. Across the road it covers the width once.</td></tr>
+<tr><td>Tiling direction</td><td>Whether the image's V (vertical) or U (horizontal) axis runs along the track.</td></tr>
+<tr><td>Repetitions along the track</td><td>Whole repetitions per lap, so the lap closes seamlessly. Shortcuts use the same density.</td></tr>
+<tr><td>Texture opacity (2D and 3D views)</td><td>Lower it to see height colors underneath. The export keeps the texture.</td></tr>
+</table></div>
+<h3>Track geometry</h3>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Uniform / Optimized</td><td><b>Uniform</b>: evenly spaced cross-sections. <b>Optimized</b>: curves, grade changes, banking and width changes get more cross-sections, straights fewer. UVs follow distance traveled, so the texture looks the same either way.</td></tr>
+<tr><td>Polygon density<span class="u">1–100 %</span></td><td>How many cross-sections the mesh has. 100 % = one per route sample; 1 % = about one every 16 m.</td></tr>
+<tr><td>Divisions across<span class="u">0–8</span></td><td>Lines along the road between both edges. 0 = edges only.</td></tr>
+<tr><td>Maximum triangles</td><td>Cap for all routes; it overrides the density.</td></tr>
+<tr><td>Optimization<span class="u">0–1</span></td><td>Optimized only: from "curves get a little more" to "straights get much less".</td></tr>
+<tr><td>Subdivide transitions</td><td>Where width changes (sections, shortcuts), adds divisions so painted lines don't bend. Drag the marks over the texture to align them with its lines; <span class="ui">+ Division</span> / <span class="ui">− Division</span>; <span class="ui">Cross-sections in the transition: every … m</span>; <span class="ui">Keep line width</span> keeps narrow stripes at their width in meters.</td></tr>
+<tr><td>Side skirts on the track · Skirt height</td><td>Skirts down to the terrain so no gap shows under the edges (terrain on only).</td></tr>
+</table></div>
+<h3>Track edges</h3>
+<p>The dirt road and the barrier are extruded from the track mesh. They open by themselves where a shortcut joins, and continue inside tunnels.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Dirt road: Side · Left / right width<span class="u">m</span></td><td>None, both, left or right, each with its width. A barrier starts where the road ends.</td></tr>
+<tr><td>Texture repetition (along)<span class="u">m</span> · Transition between sections<span class="u">m</span></td><td>Tiling, and how the road blends between sections of different width (0 = cut).</td></tr>
+<tr><td>Crash barrier: Side · Height · Thickness</td><td>Thickness 0 makes a single-sided plane facing the road.</td></tr>
+<tr><td>Barrier tiling<span class="u">m</span></td><td>Meters per repetition (red and white in the default texture).</td></tr>
+<tr><td>Include collision geometry</td><td>Adds invisible meshes for physics: a plane over the <span class="ui">Dirt road</span> and <span class="ui">Walls</span> at the outer edge. Exported in the group <code>colision</code>.</td></tr>
+<tr><td>Side height · Side thickness<span class="u">m</span></td><td>Height of the collision walls (trimmed under crossings) and thickness outward. A thick wall stops very fast cars from tunnelling through at low frame rates.</td></tr>
+</table></div>
+</section>
+
+<section class="part" id="g-terrain">
+<h2><span class="no">16</span>Terrain, hills and water</h2>
+<h3>Terrain</h3>
+<p>A terrain mesh that follows the track and never cuts through it.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Add terrain under the track</td><td>Turns the terrain on.</td></tr>
+<tr><td>Terrain type</td><td><b>Forest</b> (rolling land), <b>Beach</b> (a coast with water on one side) or <b>Mountain</b> (a cliff on one side, a rock wall on the other).</td></tr>
+<tr><td>Coast · Cliff</td><td>Which side, by racing direction. With one side, the other is forest.</td></tr>
+<tr><td>Cliff height · Rock wall height<span class="u">m</span></td><td>Drop to the water below the lowest point of the track; average height of the opposite wall.</td></tr>
+<tr><td>Land before the coast · Beach length · Track height above water<span class="u">m</span></td><td>Shape of the coastline.</td></tr>
+<tr><td>Mesh density</td><td>Cell size: higher hugs the track more closely and adds polygons.</td></tr>
+<tr><td>Maximum polygons</td><td>Cap; cells grow until it is respected.</td></tr>
+<tr><td>Margin around the track<span class="u">m</span></td><td>How far the terrain extends.</td></tr>
+<tr><td>Clearance under the track<span class="u">m</span></td><td>Minimum gap between the road surface and the terrain.</td></tr>
+<tr><td>Transition to the relief<span class="u">m</span></td><td>Distance over which the terrain goes from the track height to the general relief.</td></tr>
+<tr><td>Terrain texture · Tiling X / Y</td><td>Your ground texture and its repetitions.</td></tr>
+</table></div>
+<h3>Relief and subdivision</h3>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Extra brush subdivisions</td><td>For new <span class="ui">Paint subdivision</span> strokes: each cell side is split n + 1 times ((n + 1)² more polygons).</td></tr>
+<tr><td>Paint subdivision… · Clear paint</td><td>Start painting, or remove all painted detail.</td></tr>
+<tr><td>Sculpt relief… · Clear relief</td><td>Start sculpting, or flatten all sculpting.</td></tr>
+<tr><td>Brush size<span class="u">m</span> · Strength per touch<span class="u">m</span></td><td>Radius, and how much each touch raises or lowers at its center.</td></tr>
+<tr><td>Brush curve</td><td>The falloff shape, drawn as a curve: drag points, double-click adds, right-click removes. Each stroke keeps the curve it was painted with.</td></tr>
+<tr><td>More detail in sculpting</td><td>Sculpted areas get extra polygons so the relief stays crisp.</td></tr>
+</table></div>
+<h3>Hills and tunnels</h3>
+<p>Paint hills with the <span class="ui">Hills</span> tool. When a hill covers the track with enough height, a <b>tunnel</b> opens by itself; where it does not reach, the track runs in a cutting.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Paint hills… · Delete all</td><td>Start painting, or remove every hill.</td></tr>
+<tr><td>Brush size (radius)<span class="u">m</span></td><td>Also with <kbd>[</kbd> and <kbd>]</kbd>.</td></tr>
+<tr><td>Height<span class="u">m</span></td><td>Top height above the terrain. For new hills, or for the selected one.</td></tr>
+<tr><td>Profile</td><td><b>Gentle hill</b> (rounded slopes) or <b>Rock wall</b> (an almost vertical edge, like a cliff).</td></tr>
+<tr><td>Flat top<span class="u">0–1</span></td><td>From a rounded top to a flat plateau.</td></tr>
+<tr><td>Geometry density · Maximum triangles</td><td>Triangle size and cap for this hill.</td></tr>
+<tr><td>Control points</td><td><span class="ui">Add points (click on the hill)</span>, then raise or lower each one (gizmo or <span class="ui">Raise / lower</span>) and set its <span class="ui">Radius</span> of influence.</td></tr>
+<tr><td>Edit box (lattice)</td><td>A grid of points over the hill, joined by lines. Raise or lower any point and the hill bends smoothly between them. Set <span class="ui">Columns</span> and <span class="ui">Rows</span>; drag the center square to move the box and its corners to resize it; <span class="ui">Set to 0</span>, <span class="ui">All to 0</span>, <span class="ui">Remove box</span>.</td></tr>
+</table></div>
+<h4>Tunnel card</h4>
+<p>Click a tunnel's name (in the panel or the 3D view) to edit it.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Shape</td><td>Square with rounded corners, square, circle or oval.</td></tr>
+<tr><td>Type</td><td><b>Artificial</b> (a regular section) or <b>Natural</b> (an irregular rock cave that can open into a vault).</td></tr>
+<tr><td>Tunnel width · Clearance<span class="u">m</span></td><td>Inner size.</td></tr>
+<tr><td>Cave size · Rock density · Stalactite density</td><td>Natural tunnels: loose rocks and stalactites you can move one by one (<span class="ui">Reset positions</span>).</td></tr>
+<tr><td>Open side · Pillars</td><td>Leave one side open as a gallery held up by pillars.</td></tr>
+<tr><td>Portal frame thickness · How far the portal sticks out</td><td>The mouths at each end.</td></tr>
+<tr><td>Textures</td><td>Walls and roof: <span class="ui">Own…</span> or <span class="ui">Like the others</span>. General tunnel textures and repetition sit at the end of the panel.</td></tr>
+<tr><td>Wall decoration</td><td>Torches (or your model) along the walls: count per side, height, side, scale, rotation.</td></tr>
+<tr><td>Geometry</td><td>Uniform or optimized, density, maximum triangles, optimization. <span class="ui">Reset values</span>.</td></tr>
+</table></div>
+<p><b>Covered sections texture</b> is used inside tunnels and under crossings (by default the track texture 20 % darker).</p>
+<h3>Water: rivers, lakes and waterfalls</h3>
+<p>Paint with the <span class="ui">Water</span> tool. A filled, compact area is detected as a <b>lake</b>; a stroke that starts on a hill is a <b>waterfall</b> of that hill. Water flows downhill by itself. Each river, lake and waterfall has its own card, shown in tabs (river, lake or waterfall icon and name).</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Geometry</td><td><b>Resting on the surface</b> (water only) or <b>Carved</b> (the ground sinks into a riverbed).</td></tr>
+<tr><td>Depth<span class="u">m</span></td><td>Carved depth.</td></tr>
+<tr><td>Walls · Wall slope</td><td><b>Smooth</b> (extruded from the outline) or <b>Natural</b> (terrain rock), with the bank angle on a small chart, textures, mapping, wall width, outer faces and density. Waterfalls use smooth or rock walls.</td></tr>
+<tr><td>Rock: Style · Roughness · Rock size</td><td>For natural walls.</td></tr>
+<tr><td>Outline detail</td><td>How closely the edge follows your strokes (higher = fewer triangles).</td></tr>
+<tr><td>Type</td><td><span class="ui">Automatic</span>, <span class="ui">River</span> or <span class="ui">Lake</span>. Lakes have flat water and bed and are named <code>lago_NN</code>.</td></tr>
+<tr><td>Bed</td><td>A flat floor under the water, with its own texture.</td></tr>
+<tr><td>Water</td><td><span class="ui">Like the terrain</span> or <span class="ui">Simplified</span>; water detail; own texture; repetition U / V in meters (along the current in rivers).</td></tr>
+<tr><td>Second layer · Layer 2: U / V</td><td>A second water texture on top, with its own tiling.</td></tr>
+<tr><td>Reverse current</td><td>Rivers and waterfalls only.</td></tr>
+<tr><td>Add decoration</td><td>Lily pads, reeds or buoys on the water: shape (lying planes, standing planes, cubes), color, <span class="ui">Automatic</span> (between a distance from the shore) or <span class="ui">Painted</span>, density, size, spacing, size variation and maximum count. Exported as <code>&lt;name&gt;_deco</code>.</td></tr>
+</table></div>
+<p><kbd>Del</kbd> deletes the selected river, lake or waterfall.</p>
+</section>
+
+<section class="part" id="g-veg">
+<h2><span class="no">17</span>Vegetation and decoration</h2>
+<h3>Trees and grass</h3>
+<p>Trees are cones and grass is two crossed planes. Both are placeholders: choose models from the asset library to replace them. Each kind can have several <b>groups</b> in tabs (<span class="ui">+ New tree group</span>, <span class="ui">+ New grass group</span>), each with its own settings and texture. Later groups avoid the earlier ones.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Add trees (cones) · Add grass</td><td>Turns the group on.</td></tr>
+<tr><td>Single mesh</td><td>On: one mesh, automatic distribution and its controls active. Off: the list is frozen and each tree or tuft can be picked, moved or deleted (<span class="ui">Delete the selected one</span>, <span class="ui">Reset</span>). Grass is single mesh by default. Many loose objects slow things down.</td></tr>
+<tr><td>Where they go</td><td><span class="ui">Automatic</span> (along the track) or <span class="ui">Painted</span> (only in areas you paint with <span class="ui">Paint areas</span>).</td></tr>
+<tr><td>Side</td><td>Both sides, left or right, by racing direction.</td></tr>
+<tr><td>Density (per 100 m and per side)</td><td>How many.</td></tr>
+<tr><td>Scale</td><td>Size (trees: 1 ≈ 9 m tall).</td></tr>
+<tr><td>Distance to the edge · Scatter<span class="u">m</span></td><td>Minimum distance from the road, and how far beyond it they spread.</td></tr>
+<tr><td>Also on hills: On slopes · On the top · Density on hills</td><td>Allow them on hills (top = above 85 % of the height), per 1000 m².</td></tr>
+<tr><td>Tilt with the ground<span class="u">0–100</span></td><td>Straight up, or aligned to the surface normal.</td></tr>
+<tr><td>Models · Texture</td><td>Library models to use instead (mixed at random), or a texture for the cones / grass (PNG with transparency).</td></tr>
+<tr><td>Cast shadow · shadow position</td><td>Trees can cast shadow planes, positioned like the general setting, centered or by the sun.</td></tr>
+<tr><td>Seed (trees and grass) · Random</td><td>Same seed, same layout.</td></tr>
+</table></div>
+<h3>Decoration</h3>
+<h4>Asset library</h4>
+<p><span class="ui">Load models (FBX / GLB)…</span> adds your own models, with their pivot at the base. Use them for trees, grass, decoration sets and tunnel walls. <b>Everything you see before loading models is a placeholder</b>: cubes, cones and planes keep the layout while your real art is not in yet.</p>
+<h4>Decoration sets</h4>
+<p><span class="ui">+ New set</span> creates a set of props shown in tabs. Each set places colored cubes until you pick models.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Shape</td><td>Cubes, standing planes or lying planes (placed flat and rotated on the ground).</td></tr>
+<tr><td>Where they go</td><td><span class="ui">Automatic</span> or <span class="ui">Painted</span>. Painted sets can also go on water.</td></tr>
+<tr><td>Distribution</td><td>Next to the track, on the dirt roads, on the track, or on the track and the dirt roads.</td></tr>
+<tr><td>Side · density · size · scale per axis · size variation</td><td>Placement and size.</td></tr>
+<tr><td>Rotation</td><td>Random (with a range) or fixed relative to the track; orientation along the ground normal.</td></tr>
+<tr><td>On hill slopes · On tops</td><td>Allow them on hills.</td></tr>
+<tr><td>Models (they replace the cubes)</td><td>Click library models to use them.</td></tr>
+<tr><td>Single mesh · shadow</td><td>One mesh per material, or one object per prop; cast shadow like the general one, centered or by the sun.</td></tr>
+<tr><td>Another distribution</td><td>New random layout.</td></tr>
+</table></div>
+<h3>Shadow planes</h3>
+<p><b>These are fake shadows, not a shadow map.</b> Each tree or prop that casts shadow gets a small textured plane on the ground. Planes follow the terrain, hills and road, cost very few triangles and are exported together as one mesh (<code>sombras</code>). Turn on <span class="ui">Wireframe</span> to see the planes.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Generate shadow planes</td><td>Turns them on.</td></tr>
+<tr><td>Size</td><td>Plane size relative to the object's footprint.</td></tr>
+<tr><td>Maximum triangles per plane · Tolerance</td><td>How many triangles a plane may use to follow the ground, and how far it may lift before it is subdivided.</td></tr>
+<tr><td>General position</td><td><b>Centered</b> under the object, or <b>Cast by the sun</b>.</td></tr>
+<tr><td>Sun pad</td><td>Drag the sun in plan view: the shadow stretches to the opposite side, its base at the object's foot.</td></tr>
+<tr><td>Sun height<span class="u">°</span> · Maximum length</td><td>A low sun makes long shadows, up to the maximum (in object heights).</td></tr>
+<tr><td>3D view light follows the sun</td><td>Lights the 3D view from the same sun.</td></tr>
+<tr><td>Texture · Opacity · Edge blur · Lift off the ground</td><td>Your own shadow image, or the default one with its opacity, soft edge and lift.</td></tr>
+</table></div>
+</section>
+
+<section class="part" id="g-game">
+<h2><span class="no">18</span>Game</h2>
+<h3>Finish line and start gantry</h3>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Move the finish line…</td><td>Then click on the track on the map.</td></tr>
+<tr><td>Gantry at the starting point · Banner text · Clearance</td><td>An arch with a banner (for example <code>START</code>), exported with its pivot at the base, in the middle of the road.</td></tr>
+</table></div>
+<h3>Track items</h3>
+<p>Puddles, turbo pads, nitro strips and coin stripes, in groups (A, B, C…). Click an item (map or 3D, with Navigate) to select it and drag it; it always stays on the road and parallel to its surface. Groups without <span class="ui">Custom parameters</span> share the first group's count and sizes.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Active</td><td>Turns the group on.</td></tr>
+<tr><td>Distribution</td><td><span class="ui">Random on the track</span> (nitro and coin stripes favor curves) or <span class="ui">Only in painted areas</span>.</td></tr>
+<tr><td>Maximum count · Count</td><td>Lowering the count keeps the positions of the remaining items.</td></tr>
+<tr><td>Puddles: Diameter</td><td>All the same size.</td></tr>
+<tr><td>Turbo pads: Width · Length</td><td>The arrow points forward.</td></tr>
+<tr><td>Nitro and coin stripes: Maximum length · Length · Width (% of track width) · Position on the track</td><td>Stripes follow the road: center, inner or outer side of the curve, or a random mix.</td></tr>
+<tr><td>Coin stripes: Coins</td><td>Height above the track, size, and coins per stripe. Coins spin in the game camera and are exported as children of their stripe.</td></tr>
+<tr><td>Seed · Reset moved and deleted</td><td>New random layout; undo hand edits.</td></tr>
+<tr><td>Textures</td><td>Per item type. Nitro strips can have a glow border (zero-thickness walls with a transparent texture) of a set height.</td></tr>
+</table></div>
+<h3>Curve signage</h3>
+<p>Signs before the curves of the main route, by racing direction: right curve, left curve, roundabout (a curve that turns a lot) and zigzag (alternating curves close together). Each sign is a post and a panel, with its own texture per type.</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Signs at curves</td><td>Turns them on.</td></tr>
+<tr><td>Radius below<span class="u">m</span> · Minimum turn<span class="u">°</span></td><td>What counts as a curve.</td></tr>
+<tr><td>Zigzag: alternating curves closer than<span class="u">m</span></td><td>Groups them under one zigzag sign.</td></tr>
+<tr><td>Roundabout: turn from<span class="u">°</span></td><td>Curves that turn this much or more use the roundabout sign.</td></tr>
+<tr><td>Distance before the curve · Count per curve · Spacing</td><td>Where the signs stand and how many.</td></tr>
+<tr><td>Side · Distance from the edge</td><td>Automatic places them on the outside of the curve.</td></tr>
+<tr><td>Rotation · Height · Size · One sided</td><td>Shape of each sign.</td></tr>
+<tr><td>Detected curves</td><td>The list of curves: keep the automatic type or force another. Clicking a sign opens its curve.</td></tr>
+</table></div>
+<h3>Triggers</h3>
+<p>Invisible boxes across the whole road so the engine knows when the car passes (for example, to change lighting inside a tunnel).</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Triggers at tunnel entrances and exits · Depth · Height</td><td>Named <code>trigger_tunel_NN_entrada</code> and <code>_salida</code>.</td></tr>
+<tr><td>Show triggers in the 3D view</td><td>They look semi-transparent in the editor and are invisible when exported.</td></tr>
+<tr><td>+ New trigger</td><td>A custom trigger: place it on the track, rename it, size it.</td></tr>
+</table></div>
+<h3>Nodes</h3>
+<p>Small invisible cubes spread evenly along the main spline, for lap progress, ordering and AI paths. Numbered from 0 (start) to the end; on a closed circuit the first and last coincide. Each one sits on the spline with its rotation (direction, grade and banking).</p>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>What it does</th></tr>
+<tr><td>Nodes along the track · Count · Size · Height above the spline</td><td>Exported as <code>nodos/nodo_0</code>, <code>nodo_1</code>…; shown in magenta (toggle <span class="ui">Nodes</span> in the 3D toolbar).</td></tr>
+</table></div>
+<h3>Sky</h3>
+<p><span class="ui">Load sky…</span> or <span class="ui">Default sky</span>. Only visible in the game camera. Use an equirectangular panorama (twice as wide as tall).</p>
+</section>
+
+<section class="part" id="gamecam">
+<h2><span class="no">19</span>Game camera</h2>
+<p class="where">3D view toolbar · <b>Game camera</b></p>
+<p>A car drives the track on its own so you can feel the layout at speed.</p>
+<div class="tbl"><table>
+<tr><th>Control</th><th>What it does</th></tr>
+<tr><td>Third person · First person</td><td>Behind the car, or from the seat (<kbd>C</kbd> toggles).</td></tr>
+<tr><td>Speed<span class="u">km/h</span></td><td>Driving speed.</td></tr>
+<tr><td>Pause · Restart · Full screen · Exit</td><td><kbd>Space</kbd> pauses, <kbd>Esc</kbd> exits.</td></tr>
+<tr><td>Show guide · Hide triggers</td><td>Overlay the route line; hide trigger boxes while driving.</td></tr>
+<tr><td>Adjust camera</td><td>Distance (also mouse wheel), height, tilt, field of view and drift.</td></tr>
+<tr><td>3D car… · 3D car adjust · Remove 3D car</td><td>Load your own car (FBX or GLB): it is scaled to the default car's size and placed on the track. Adjust height, X / Y / Z scale, brightness and rotation.</td></tr>
+<tr><td>Orbit</td><td>Left-drag orbits around the car; right click goes back to the normal camera.</td></tr>
+</table></div>
+<p>The HUD shows speed, position on the lap, grade, banking, height and lap time. In the profile, drag the little car to jump to another point.</p>
+</section>
+
+<section class="part" id="saving">
+<h2><span class="no">20</span>Saving and autosave</h2>
+<ul>
+  <li><span class="ui">Save</span> downloads <code>&lt;project name&gt;.tsg.json</code> with everything: shape, heights, scene, textures and models. <span class="ui">Open</span> loads it back.</li>
+  <li><b>Autosave</b> (Settings) keeps copies every few minutes when something changed:
+    <ul>
+      <li>always in this browser;</li>
+      <li>in the server folder when you run the app with <code>node server.js</code>;</li>
+      <li>also in a folder of your choice in Chrome or Edge (<span class="ui">Choose folder…</span>; after reopening the app press <span class="ui">Grant permission</span> once).</li>
+    </ul>
+  </li>
+  <li><span class="ui">Save a copy now</span> and <span class="ui">Open autosave…</span> (a list with thumbnail and date) are in the same place.</li>
+</ul>
+</section>
+
+<section class="part" id="export">
+<h2><span class="no">21</span>Exporting</h2>
+<p class="where">Top bar · <b>Export</b></p>
+<div class="tbl"><table>
+<tr><th>Format</th><th>Contents</th></tr>
+<tr><td>Scene (.glb)</td><td>The complete scene in one binary glTF: track with UVs, terrain, hills, tunnels, edges, sections, trees, decoration, items, triggers, nodes and colliders, each as its own object with its pivot and embedded textures. Imports into Blender (File › Import › glTF 2.0) and 3ds Max 2023+.</td></tr>
+<tr><td>Scene (.fbx)</td><td>The same scene in FBX for Blender, 3ds Max, Maya, Unity and Unreal.</td></tr>
+<tr><td>Blender (.py) · 3ds Max (.ms)</td><td>Scripts that build the curves inside the program.</td></tr>
+<tr><td>JSON · OBJ</td><td>Track data, or the curves as OBJ lines.</td></tr>
+</table></div>
+<h4>Curve options</h4>
+<ul>
+  <li><span class="ui">Bézier knot spacing</span>, <span class="ui">Export left / right edges</span>.</li>
+  <li>For Blender: <span class="ui">Profile as bevel (visible track)</span>, <span class="ui">Invert bank sign</span>.</li>
+</ul>
+<h4>Object names in the scene</h4>
+<p>Names are the same in any interface language (they use Spanish words):</p>
+<div class="tbl"><table>
+<tr><th>Object</th><th>Name</th></tr>
+<tr><td>Road</td><td><code>pista/ruta_principal</code>, shortcuts <code>atajo_NN</code></td></tr>
+<tr><td>Edges</td><td><code>bordes/camino_tierra_…</code>, <code>bordes/barrera_…</code></td></tr>
+<tr><td>Terrain, hills, tunnels</td><td><code>terreno</code>, <code>cerros/cerro_NN</code>, <code>tuneles/tunel_NN/…</code></td></tr>
+<tr><td>Water</td><td><code>rios/rio_NN</code>, <code>lago_NN</code>, <code>cascada_NN</code>, <code>…_capa2</code>, <code>…_lecho</code></td></tr>
+<tr><td>Sections</td><td><code>tramos/tramo_NN</code>, <code>puentes/puente_NN</code>, <code>socavado_NN_paredes</code></td></tr>
+<tr><td>Vegetation and shadows</td><td><code>arboles</code>, <code>hierba</code> (<code>_2</code>, <code>_3</code>… per group), <code>decoracion/&lt;set&gt;</code>, <code>sombras</code></td></tr>
+<tr><td>Gameplay</td><td><code>elementos_pista/…</code> (e.g. <code>coinstripeA-1_moneda_1</code>), <code>senaletica/senal_…</code>, <code>triggers/…</code>, <code>nodos/nodo_N</code>, <code>portico_salida</code></td></tr>
+<tr><td>Physics</td><td><code>colision</code></td></tr>
+</table></div>
+</section>
+
+<section class="part" id="keys">
+<h2><span class="no">22</span>Keyboard shortcuts</h2>
+<p>Every shortcut can be changed in <span class="ui">Settings</span>, and any button can get its own by right-clicking it.</p>
+<div class="tbl"><table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>K</kbd> or <kbd>/</kbd></td><td>Search</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>Undo</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>V</kbd></td><td>Paste a minimap image (traced automatically) or a reference image</td></tr>
+<tr><td><kbd>Esc</kbd></td><td>Back to Navigate and clear the selection; exits the game camera and windows</td></tr>
+<tr><td><kbd>1</kbd> / <kbd>2</kbd></td><td>Vertex / segment level (Edit points)</td></tr>
+<tr><td><kbd>W</kbd> / <kbd>E</kbd> / <kbd>R</kbd></td><td>Move / rotate / scale</td></tr>
+<tr><td><kbd>Del</kbd>, <kbd>Backspace</kbd></td><td>Delete the selection (points, shortcut, item, river, hill, trigger)</td></tr>
+<tr><td><kbd>[</kbd> / <kbd>]</kbd></td><td>Smaller / larger brush</td></tr>
+<tr><td><kbd>F</kbd></td><td>Frame the selection in 3D</td></tr>
+<tr><td><kbd>F3</kbd></td><td>Wireframe</td></tr>
+<tr><td><kbd>C</kbd> / <kbd>Space</kbd></td><td>Switch camera / pause (game camera)</td></tr>
+<tr><td><kbd>Shift</kbd> with a brush</td><td>Navigate without painting</td></tr>
+<tr><td><kbd>Alt</kbd> or right click with a brush</td><td>Erase</td></tr>
+</table></div>
+</section>
+
+<section class="part" id="tips">
+<h2><span class="no">23</span>Tips</h2>
+<ul>
+  <li><b>Decide scale and direction early.</b> Changing <span class="ui">Lap length</span> rescales everything, and reversing the direction rebuilds sides, signs and river flow.</li>
+  <li><b>Curves:</b> keep the tightest radius around 1.5 times the track width; tighter hairpins raise warnings. Use <span class="ui">Radius</span> for clean arcs and <span class="ui">Smooth</span> for shaky strokes.</li>
+  <li><b>Heights:</b> 10 % maximum grade is a safe default; 12–15 % is the arcade limit. Keep the finish line flat. A crossing needs the clearance plus the deck (about 7 m).</li>
+  <li><b>Shortcuts</b> should leave and rejoin tangent to the main track. A good one is shorter but harder.</li>
+  <li><b>Free scenery:</b> a hill over the track gives a tunnel; a river under a bridge looks great; signs and edges help players read the track.</li>
+  <li><b>Performance:</b> watch the triangle counter, use <span class="ui">Optimized</span> track geometry, lower terrain density, use <span class="ui">Line</span> mode and higher outline detail for rivers, and keep <span class="ui">Single mesh</span> on for trees and grass.</li>
+  <li><b>Something missing?</b> Check that its section is turned on, then use <a href="#search">Search</a>.</li>
+  <li><b>Before delivering:</b> drive it, read the warnings panel, save the project and export.</li>
+</ul>
+</section>
+
+<footer>
+  Track Spline Generator · manual for version 0.90 · by Bekho Team. The app is under active development; some interface texts may still appear in Spanish.
+</footer>
+</main>
+</div>
+
+<script>
+(function(){
+  var toc=document.getElementById('toc'), links=[].slice.call(toc.querySelectorAll('a[href^="#"]'));
+  var parts=[].slice.call(document.querySelectorAll('section.part'));
+  // contenido activo en el índice
+  function onScroll(){
+    var y=window.scrollY+120, cur=null;
+    parts.forEach(function(s){ if(!s.classList.contains('hidden-by-find') && s.offsetTop<=y) cur=s.id; });
+    links.forEach(function(a){ a.classList.toggle('on', a.getAttribute('href')==='#'+cur); });
+  }
+  window.addEventListener('scroll', onScroll, {passive:true}); onScroll();
+  // índice plegable en el teléfono
+  var mt=document.getElementById('mtoggle');
+  mt.addEventListener('click', function(){ var o=toc.classList.toggle('open'); mt.setAttribute('aria-expanded', o); mt.textContent=o?'Hide contents':'Show contents'; });
+  links.forEach(function(a){ a.addEventListener('click', function(){ if(window.innerWidth<=900){ toc.classList.remove('open'); mt.setAttribute('aria-expanded', false); mt.textContent='Show contents'; } }); });
+  // búsqueda dentro del manual: filtra filas, párrafos y secciones y resalta
+  var find=document.getElementById('find'), info=document.getElementById('findinfo');
+  var blocks=[].slice.call(document.querySelectorAll('main tr, main p, main li, main .tile, main h3, main h4'));
+  blocks.forEach(function(b){ b.dataset.html=b.innerHTML; });
+  var timer=null;
+  function esc(s){ return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
+  function run(){
+    var q=find.value.trim().toLowerCase();
+    blocks.forEach(function(b){ b.innerHTML=b.dataset.html; b.classList.remove('hidden-by-find'); });
+    parts.forEach(function(s){ s.classList.remove('hidden-by-find'); });
+    document.querySelectorAll('main .tbl').forEach(function(t){ t.classList.remove('hidden-by-find'); });
+    if(q.length<2){ info.textContent=''; onScroll(); return; }
+    var re=new RegExp('('+esc(q)+')','gi'), hits=0;
+    parts.forEach(function(s){
+      var any=false;
+      s.querySelectorAll('tr').forEach(function(tr){
+        if(tr.querySelector('th')) return;
+        var m=tr.textContent.toLowerCase().indexOf(q)>=0;
+        tr.classList.toggle('hidden-by-find', !m);
+        if(m){ any=true; hits++; }
+      });
+      s.querySelectorAll('.tbl').forEach(function(t){ var vis=[].slice.call(t.querySelectorAll('tr')).some(function(tr){ return !tr.querySelector('th') && !tr.classList.contains('hidden-by-find'); }); t.classList.toggle('hidden-by-find', !vis); });
+      s.querySelectorAll('p, li, .tile, h3, h4').forEach(function(el){
+        if(el.closest('table')) return;
+        var m=el.textContent.toLowerCase().indexOf(q)>=0;
+        if(m){ any=true; hits++; }
+      });
+      s.classList.toggle('hidden-by-find', !any);
+    });
+    blocks.forEach(function(b){ if(b.classList.contains('hidden-by-find')) return; if(b.textContent.toLowerCase().indexOf(q)<0) return; walk(b, re); });
+    info.textContent = hits ? hits+' match'+(hits===1?'':'es')+' · Esc clears' : 'No matches. Try another word.';
+    onScroll();
+  }
+  function walk(el, re){
+    [].slice.call(el.childNodes).forEach(function(n){
+      if(n.nodeType===3){ if(re.test(n.nodeValue)){ re.lastIndex=0; var span=document.createElement('span'); span.innerHTML=n.nodeValue.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(re,'<mark>$1</mark>'); n.replaceWith(span); } re.lastIndex=0; }
+      else if(n.nodeType===1 && n.tagName!=='MARK') walk(n, re);
+    });
+  }
+  find.addEventListener('input', function(){ clearTimeout(timer); timer=setTimeout(run, 120); });
+  find.addEventListener('keydown', function(e){ if(e.key==='Escape'){ find.value=''; run(); } });
+  document.addEventListener('keydown', function(e){ if((e.key==='/' && document.activeElement!==find && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)) || ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='k')){ e.preventDefault(); find.focus(); } });
+})();
+</script>
+</body>
+</html>
